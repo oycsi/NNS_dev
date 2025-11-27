@@ -32,7 +32,7 @@ img_base64 = get_img_as_base64(icon_path)
 
 # Page Configuration
 st.set_page_config(
-    page_title="Negative News Smart Scan",
+    page_title="Neo Armstrong Cyclone Jet Armstrong Cannon",
     page_icon=peashooter_icon,
     layout="wide",
     initial_sidebar_state="expanded"
@@ -69,7 +69,7 @@ st.markdown(
             <img src="data:image/png;base64,{img_base64}" style="width: 180px; height: 180px; object-fit: contain;">
         </div>
         <div style="flex: 1; display: flex; flex-direction: column; justify-content: space-between; height: 180px;">
-            <h1 style="margin: 0; padding: 0; font-size: 3rem; line-height: 1.2;">Negative News Smart Scan</h1>
+            <h1 style="margin: 0; padding: 0; font-size: 3rem; line-height: 1.2;">Neo Armstrong Cyclone Jet Armstrong Cannon</h1>
             <p style="margin: 0; font-size: 1.5rem; font-weight: 500; align-self: flex-start;">快點做完  回家喝奶茶！</p>
         </div>
     </div>
@@ -338,7 +338,7 @@ if st.session_state.analysis_results:
                 worksheet.set_column(i, i, column_len)
                 
         excel_data = output.getvalue()
-        file_name = f"Negative_News_Report_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+        file_name = f"Neo Armstrong Cyclone Jet Armstrong Cannon_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
         
         st.download_button(
             label="Download Excel Report",
@@ -351,4 +351,4 @@ if st.session_state.analysis_results:
 
 # Footer
 st.markdown("---")
-st.markdown("© 2024 Negative News Smart Scan | Powered by Streamlit & Perplexity AI")
+st.markdown("© 2025 Tiara😘 | Powered by Streamlit & Perplexity AI & me")
