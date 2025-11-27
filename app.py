@@ -8,6 +8,7 @@ import scraper_web
 import pplx_service
 import importlib
 import re
+import os
 
 # Force reload for development
 importlib.reload(scraper_web)
@@ -17,7 +18,8 @@ importlib.reload(pplx_service)
 import base64
 
 # Load peashooter icon path
-icon_path = '/Users/user/.gemini/antigravity/brain/de1b05ed-c669-4ff9-a2bf-bc6f9e778433/peashooter_icon.png'
+current_dir = os.path.dirname(os.path.abspath(__file__))
+icon_path = os.path.join(current_dir, "image.png")
 peashooter_icon = Image.open(icon_path)
 
 # Function to convert image to base64
