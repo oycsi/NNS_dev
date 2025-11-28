@@ -5,14 +5,17 @@ import io
 import time
 from datetime import datetime, timedelta
 import scraper_web
-import pplx_service
+import llm_service
 import importlib
 import re
 import os
+import json
+import openai
+from streamlit_local_storage import LocalStorage
 
 # Force reload for development
 importlib.reload(scraper_web)
-importlib.reload(pplx_service)
+importlib.reload(llm_service)
 
 # Load peashooter icon
 import base64
@@ -32,11 +35,14 @@ img_base64 = get_img_as_base64(icon_path)
 
 # Page Configuration
 st.set_page_config(
-    page_title="Neo Armstrong Cyclone Jet Armstrong Cannon",
+    page_title="新阿姆斯特朗旋風噴射阿姆斯特朗砲",
     page_icon=peashooter_icon,
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Initialize Local Storage
+localS = LocalStorage()
 
 # Initialize Session State
 if 'scraped_news' not in st.session_state:
@@ -48,12 +54,27 @@ if 'is_scanning' not in st.session_state:
 if 'stop_scan' not in st.session_state:
     st.session_state.stop_scan = False
 if 'available_keywords' not in st.session_state:
-    st.session_state.available_keywords = [
-        "貪污", "詐騙", "洗錢", "制裁", "稅務犯罪", 
-        "證券犯罪", "販毒", "人口販運", "走私", "謀殺"
-    ]
+    # Try to load from local storage
+    stored_keywords = localS.getItem("user_keywords")
+    if stored_keywords and isinstance(stored_keywords, list):
+        st.session_state.available_keywords = stored_keywords
+    else:
+        st.session_state.available_keywords = [
+            "貪污", "詐騙", "洗錢", "制裁", "稅務犯罪", 
+            "證券犯罪", "販毒", "人口販運", "走私", "謀殺"
+        ]
 if 'selected_keywords' not in st.session_state:
     st.session_state.selected_keywords = st.session_state.available_keywords.copy()
+if 'llm_provider' not in st.session_state:
+    st.session_state.llm_provider = "Perplexity"
+if 'scan_completed' not in st.session_state:
+    st.session_state.scan_completed = False
+if 'expander_state' not in st.session_state:
+    st.session_state.expander_state = False
+if 'show_aggregation' not in st.session_state:
+    st.session_state.show_aggregation = False
+if 'show_analysis' not in st.session_state:
+    st.session_state.show_analysis = False
 
 # Helper function to check for Chinese characters
 def has_chinese(text):
@@ -69,10 +90,23 @@ st.markdown(
             <img src="data:image/png;base64,{img_base64}" style="width: 180px; height: 180px; object-fit: contain;">
         </div>
         <div style="flex: 1; display: flex; flex-direction: column; justify-content: space-between; height: 180px;">
-            <h1 style="margin: 0; padding: 0; font-size: 3rem; line-height: 1.2;">Neo Armstrong Cyclone Jet Armstrong Cannon</h1>
-            <p style="margin: 0; font-size: 1.5rem; font-weight: 500; align-self: flex-start;">快點做完  回家喝奶茶！</p>
+            <h1 style="margin: 0; padding: 0; font-size: 3.5rem; line-height: 1.2;">新阿姆斯特朗旋風噴射阿姆斯特朗砲</h1>
+            <p style="margin: 0; font-size: 1.5rem; font-weight: 500; align-self: flex-start;">趕快做完  回家喝奶茶！</p>
         </div>
     </div>
+    """,
+    unsafe_allow_html=True
+)
+
+# Custom CSS to hide "Press Enter to apply"
+st.markdown(
+    """
+    <style>
+    /* Hide 'Press Enter to apply' instructions */
+    [data-testid="InputInstructions"] {
+        display: none;
+    }
+    </style>
     """,
     unsafe_allow_html=True
 )
@@ -81,11 +115,24 @@ st.markdown(
 with st.sidebar:
     st.header("Configuration")
     
+    # LLM Provider Selection
+    llm_provider = st.selectbox(
+        "LLM Provider",
+        options=["Perplexity", "OpenAI", "Google Gemini", "Meta Llama (Together.ai)"],
+        index=["Perplexity", "OpenAI", "Google Gemini", "Meta Llama (Together.ai)"].index(st.session_state.llm_provider),
+        help="Select your LLM API provider"
+    )
+    st.session_state.llm_provider = llm_provider
+    
     # API Key (No default)
-    api_key = st.text_input("API Key", type="password", help="Enter your API key here.")
+    api_key = st.text_input(
+        f"{llm_provider} API Key", 
+        type="password", 
+        help=f"Enter your {llm_provider} API key here."
+    )
     
     # === Keyword Management Section ===
-    st.subheader("Keyword Management")
+    st.subheader("Keyword")
     
     # Multiselect for keyword management (at the top)
     selected = st.multiselect(
@@ -101,6 +148,8 @@ with st.sidebar:
         st.rerun()
     
     # Add new keyword input (second position)
+    st.text("")  # Empty text for spacing
+    st.markdown("<p style='margin-bottom: 0.5rem; font-size: 0.875rem; font-weight: 400;'>Keyword Management</p>", unsafe_allow_html=True)
     col_add_input, col_add_btn = st.columns([6, 1])
     with col_add_input:
         new_keyword = st.text_input(
@@ -118,6 +167,8 @@ with st.sidebar:
             # Add to available keywords if not exists
             if keyword_stripped not in st.session_state.available_keywords:
                 st.session_state.available_keywords.append(keyword_stripped)
+                # Save to local storage
+                localS.setItem("user_keywords", st.session_state.available_keywords)
             # Add to selected keywords if not already selected
             if keyword_stripped not in st.session_state.selected_keywords:
                 st.session_state.selected_keywords.append(keyword_stripped)
@@ -130,14 +181,18 @@ with st.sidebar:
             keyword_to_remove = st.selectbox(
                 "Remove from library",
                 options=st.session_state.available_keywords,
+                index=None,
+                placeholder="Select a keyword to delete",
                 label_visibility="collapsed",
                 key="remove_keyword_select",
                 help="Permanently remove keyword from available list"
             )
         with col_del_btn:
             if st.button("🗑️", key="remove_from_available", help="Delete from library", use_container_width=True):
-                if keyword_to_remove in st.session_state.available_keywords:
+                if keyword_to_remove and keyword_to_remove in st.session_state.available_keywords:
                     st.session_state.available_keywords.remove(keyword_to_remove)
+                    # Save to local storage
+                    localS.setItem("user_keywords", st.session_state.available_keywords)
                     # Also remove from selected if present
                     if keyword_to_remove in st.session_state.selected_keywords:
                         st.session_state.selected_keywords.remove(keyword_to_remove)
@@ -173,6 +228,9 @@ if start_btn:
     st.session_state.scraped_news = [] # Reset on new scan
     st.session_state.analysis_results = []
     st.session_state.stop_scan = False
+    st.session_state.scan_completed = False  # Reset completion flag
+    st.session_state.show_aggregation = False  # Will be set to True after scan completes
+    st.session_state.show_analysis = False  # Reset analysis section
     
     if not final_keywords:
         st.warning("Please select or enter at least one keyword.")
@@ -214,17 +272,40 @@ if start_btn:
             progress = (idx + 1) / len(final_keywords)
             progress_bar.progress(progress)
             
-        if not st.session_state.stop_scan:
+        # Handle stop scan scenario
+        if st.session_state.stop_scan:
+            status_container.update(label="Scanning stopped by user.", state="error")
+            st.session_state.scraped_news = all_news_items
+            st.session_state.scan_completed = True # Treat partial scan as completed for display purposes
+            st.session_state.show_aggregation = True # Show what we found so far
+            
+            if not all_news_items:
+                st.warning("No relevant news found (scan stopped).")
+            else:
+                st.success(f"Found {len(all_news_items)} relevant news items (scan stopped).")
+                
+        elif not st.session_state.stop_scan:
             status_container.update(label="Scraping complete!", state="complete", expanded=False)
             st.session_state.scraped_news = all_news_items
+            st.session_state.scan_completed = True  # Mark scan as completed
+            st.session_state.show_aggregation = True  # Show aggregation permanently
             
             if not all_news_items:
                 st.warning("No relevant news found.")
             else:
                 st.success(f"Found {len(all_news_items)} relevant news items.")
+                
+        # Rerun to refresh the UI and show the persistent section instead of the temporary one
+        st.rerun()
 
+# Display News Aggregation section when it should be shown (Persistent Section)
+# We only show this if we are NOT currently running a new scan (start_btn is False)
+if st.session_state.show_aggregation and st.session_state.scan_completed and not start_btn:
+    st.subheader("1. News Aggregation")
+    st.success(f"Found {len(st.session_state.scraped_news)} relevant news items.")
+    
 # Display Scraped Data & Action Buttons
-if st.session_state.scraped_news:
+if st.session_state.scraped_news and st.session_state.scan_completed:
     st.subheader("Raw Data Preview")
     
     # Export raw data button
@@ -232,12 +313,24 @@ if st.session_state.scraped_news:
     raw_output = io.BytesIO()
     with pd.ExcelWriter(raw_output, engine='xlsxwriter') as writer:
         raw_df.to_excel(writer, index=False, sheet_name='Raw Data')
+        
+        # Auto-adjust columns width with max 72
+        workbook = writer.book
+        worksheet = writer.sheets['Raw Data']
+        for i, col in enumerate(raw_df.columns):
+            column_len = max(raw_df[col].astype(str).map(len).max(), len(col)) + 2
+            column_len = min(column_len, 72)  # Cap at 72
+            worksheet.set_column(i, i, column_len)
+    
     raw_excel_data = raw_output.getvalue()
     
     col_exp, col_export = st.columns([5, 1])
     with col_exp:
-        with st.expander("View Scraped News", expanded=False):
+        with st.expander("View Scraped News", expanded=st.session_state.expander_state):
             st.dataframe(raw_df)
+            # Track if user manually changed expander state
+            if st.session_state.expander_state != st.session_state.get('prev_expander_state', False):
+                st.session_state.prev_expander_state = st.session_state.expander_state
     with col_export:
         st.download_button(
             label="Export",
@@ -255,34 +348,73 @@ if st.session_state.scraped_news:
     button_placeholder = st.empty()
     
     with button_placeholder.container():
-        col_btns = st.columns([1, 4])
+        col_btns = st.columns([1, 1])
         with col_btns[0]:
-            continue_btn = st.button("Continue Analysis", type="primary")
+            continue_btn = st.button("Continue", type="primary", use_container_width=True)
         with col_btns[1]:
-            reset_main_btn = st.button("Reset", type="secondary")
+            reset_main_btn = st.button("Reset", type="secondary", use_container_width=True)
         
     if reset_main_btn:
         st.session_state.scraped_news = []
         st.session_state.analysis_results = []
         st.session_state.is_scanning = False
         st.session_state.stop_scan = False
+        st.session_state.scan_completed = False
+        st.session_state.show_aggregation = False
+        st.session_state.show_analysis = False
+        st.session_state.expander_state = False
         st.rerun()
     
     if continue_btn:
         # Clear buttons to prevent duplication/clutter during analysis
         button_placeholder.empty()
+        st.session_state.show_analysis = True  # Show analysis section
         
         if not api_key:
-            st.error("Please enter your Perplexity API Key in the sidebar to proceed.")
+            st.error(f"Please enter your {st.session_state.llm_provider} API Key in the sidebar to proceed.")
         else:
             st.subheader("2. AI Intelligence Analysis")
-            with st.spinner("Analyzing content with Perplexity AI..."):
+            with st.spinner(f"Analyzing content with {st.session_state.llm_provider}..."):
                 try:
                     # Run Analysis
-                    results = pplx_service.analyze_news(st.session_state.scraped_news, api_key)
+                    results = llm_service.analyze_news(
+                        st.session_state.scraped_news, 
+                        api_key,
+                        provider=st.session_state.llm_provider
+                    )
                     st.session_state.analysis_results = results
+                    if not results:
+                        st.warning("Analysis completed but no valid events with named individuals were found.")
+                except json.JSONDecodeError as e:
+                    st.error(f"❌ Failed to parse {st.session_state.llm_provider} response. The API returned invalid JSON.")
+                    st.error(f"Error details: {str(e)}")
+                    if st.button("Retry", use_container_width=True, type="primary", key="retry_json"):
+                        st.rerun()
+                except openai.AuthenticationError:
+                    st.error(f"❌ Authentication failed. Please check your {st.session_state.llm_provider} API key.")
+                    if st.button("Retry", use_container_width=True, type="primary", key="retry_auth"):
+                        st.rerun()
+                except openai.RateLimitError:
+                    st.error(f"❌ Rate limit exceeded for {st.session_state.llm_provider}. Please wait and try again.")
+                    if st.button("Retry", use_container_width=True, type="primary", key="retry_rate"):
+                        st.rerun()
+                except openai.APIError as e:
+                    st.error(f"❌ {st.session_state.llm_provider} API error: {str(e)}")
+                    if st.button("Retry", use_container_width=True, type="primary", key="retry_api"):
+                        st.rerun()
                 except Exception as e:
-                    st.error(f"An error occurred during analysis: {e}")
+                    st.error(f"❌ An unexpected error occurred during analysis: {str(e)}")
+                    st.error("Please check your API key and try again.")
+                    import traceback
+                    st.code(traceback.format_exc())
+                    if st.button("Retry", use_container_width=True, type="primary", key="retry_general"):
+                        st.rerun()
+
+# Display Analysis Section Header (persists when editing sidebar)
+if st.session_state.show_analysis:
+    if not st.session_state.analysis_results:
+        st.subheader("2. AI Intelligence Analysis")
+        st.info("Analysis in progress or encountered an error. Please check above.")
 
 # Display Analysis Results
 if st.session_state.analysis_results:
@@ -330,15 +462,16 @@ if st.session_state.analysis_results:
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             df_display.to_excel(writer, index=False, sheet_name='Intelligence Report')
             
-            # Auto-adjust columns width
+            # Auto-adjust columns width with max 72
             workbook = writer.book
             worksheet = writer.sheets['Intelligence Report']
             for i, col in enumerate(df_display.columns):
                 column_len = max(df_display[col].astype(str).map(len).max(), len(col)) + 2
+                column_len = min(column_len, 72)  # Cap at 72
                 worksheet.set_column(i, i, column_len)
                 
         excel_data = output.getvalue()
-        file_name = f"Neo Armstrong Cyclone Jet Armstrong Cannon_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+        file_name = f"新阿姆斯特朗旋風噴射阿姆斯特朗砲_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
         
         st.download_button(
             label="Download Excel Report",
@@ -351,4 +484,4 @@ if st.session_state.analysis_results:
 
 # Footer
 st.markdown("---")
-st.markdown("© 2025 Tiara😘 | Powered by Streamlit & Perplexity AI & me")
+st.markdown("© 2025 Tiara😘me | Powered by Streamlit ")

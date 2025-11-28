@@ -32,8 +32,11 @@ def fetch_news(keywords, start_date, end_date):
     }
 
     # Format dates for query (YYYY-MM-DD)
+    # Note: Google News 'before:' operator is EXCLUSIVE, so we need to add 1 day to make it inclusive
     after_str = start_date.strftime("%Y-%m-%d")
-    before_str = end_date.strftime("%Y-%m-%d")
+    # Add 1 day to end_date to make the range inclusive
+    end_date_inclusive = end_date + timedelta(days=1)
+    before_str = end_date_inclusive.strftime("%Y-%m-%d")
 
     for keyword in keywords:
         try:
@@ -113,6 +116,7 @@ def extract_article_content(url):
     """
     Attempts to extract the main content from a news article URL.
     Note: Google News links are redirects. Requests handles redirects automatically.
+    Uses improved heuristics to extract only article body content.
     """
     try:
         headers = {
@@ -123,17 +127,59 @@ def extract_article_content(url):
         
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # Remove script and style elements
-        for script in soup(["script", "style", "nav", "footer", "header"]):
-            script.decompose()
-            
-        # Get text
-        text = soup.get_text(separator=' ', strip=True)
+        # Remove non-content elements
+        for element in soup(["script", "style", "nav", "footer", "header", "aside", 
+                            "iframe", "noscript", "form"]):
+            element.decompose()
         
-        # Simple heuristic to get the main body
+        # Remove common ad and navigation containers
+        for class_name in ['advertisement', 'ad-', 'sidebar', 'related', 'comments', 
+                          'social-share', 'navigation', 'menu', 'footer', 'header']:
+            for element in soup.find_all(class_=lambda x: x and class_name in x.lower()):
+                element.decompose()
+        
+        # Try to find the main article content using semantic HTML tags
+        article_content = None
+        
+        # Priority 1: Look for <article> tag
+        article_tag = soup.find('article')
+        if article_tag:
+            article_content = article_tag
+        
+        # Priority 2: Look for <main> tag
+        if not article_content:
+            main_tag = soup.find('main')
+            if main_tag:
+                article_content = main_tag
+        
+        # Priority 3: Look for divs with article-related classes
+        if not article_content:
+            for class_pattern in ['article', 'content', 'post', 'story', 'entry']:
+                content_div = soup.find('div', class_=lambda x: x and class_pattern in x.lower())
+                if content_div:
+                    article_content = content_div
+                    break
+        
+        # Extract text from the identified article content or fall back to body
+        if article_content:
+            # Get all paragraphs from the article content
+            paragraphs = article_content.find_all('p')
+            text_parts = [p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 30]
+            text = ' '.join(text_parts)
+        else:
+            # Fallback: get all paragraphs from the entire page
+            paragraphs = soup.find_all('p')
+            text_parts = [p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 30]
+            text = ' '.join(text_parts)
+        
+        # If still no text, fallback to all text
+        if not text:
+            text = soup.get_text(separator=' ', strip=True)
+        
         if not text:
             return "Failed to fetch"
             
+        # Return up to 5000 characters
         return text[:5000] 
         
     except Exception as e:
