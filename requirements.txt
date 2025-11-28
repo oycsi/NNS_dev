@@ -6,3 +6,4 @@ pandas
 openpyxl
 xlsxwriter
 lxml
+streamlit-local-storage
