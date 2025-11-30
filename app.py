@@ -484,4 +484,4 @@ if st.session_state.analysis_results:
 
 # Footer
 st.markdown("---")
-st.markdown("© 2025 Tiara😘Jose | Powered by Streamlit ")
+st.markdown("© 2025 Tiara😘 | Powered by Streamlit ")
