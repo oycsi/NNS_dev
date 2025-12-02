@@ -60,8 +60,9 @@ if 'available_keywords' not in st.session_state:
         st.session_state.available_keywords = stored_keywords
     else:
         st.session_state.available_keywords = [
-            "貪污", "詐騙", "洗錢", "制裁", "稅務犯罪", 
-            "證券犯罪", "販毒", "人口販運", "走私", "謀殺"
+            "貪污", "詐騙", "洗錢", "制裁", "證交法", 
+            "洗錢防制法", "販毒", "人口販運", "走私", 
+            "內線", "刑法"
         ]
 if 'selected_keywords' not in st.session_state:
     st.session_state.selected_keywords = st.session_state.available_keywords.copy()
