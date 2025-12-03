@@ -10,19 +10,23 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 LLM_PROVIDERS = {
     "Perplexity": {
         "base_url": "https://api.perplexity.ai",
-        "model": "sonar-pro"
+        "model": "sonar-pro",
+        "cheap_model": "sonar" # Lightweight model for screening
     },
     "OpenAI": {
         "base_url": "https://api.openai.com/v1",
-        "model": "gpt-4o"
+        "model": "gpt-4o",
+        "cheap_model": "gpt-4o-mini"
     },
     "Google Gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "model": "gemini-2.0-flash-exp"
+        "model": "gemini-2.0-flash-exp",
+        "cheap_model": "gemini-2.0-flash-exp" # Gemini Flash is already cheap/fast
     },
     "Meta Llama (Together.ai)": {
         "base_url": "https://api.together.xyz/v1",
-        "model": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"
+        "model": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+        "cheap_model": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
     }
 }
 
@@ -61,14 +65,112 @@ def is_complete_name(name):
     
     return False
 
+def screen_titles(news_items, keywords, api_key, provider="Perplexity"):
+    """
+    Phase 1: Batch Title Screening.
+    Uses a lightweight model to filter out irrelevant titles before content fetching.
+    
+    Args:
+        news_items (list): List of news item dictionaries (from RSS).
+        keywords (list): List of keywords used for search.
+        api_key (str): API Key.
+        provider (str): LLM provider.
+        
+    Returns:
+        list: Filtered list of news items that passed the screening.
+    """
+    if not news_items:
+        return []
+        
+    # Validate provider
+    if provider not in LLM_PROVIDERS:
+        logging.error(f"Invalid provider: {provider}. Defaulting to Perplexity.")
+        provider = "Perplexity"
+    
+    config = LLM_PROVIDERS[provider]
+    base_url = config["base_url"]
+    model = config.get("cheap_model", config["model"]) # Use cheap model if available
+    
+    try:
+        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        logging.info(f"Screening titles using {provider} with model {model}")
+    except Exception as e:
+        logging.error(f"Failed to initialize {provider} client: {e}")
+        return news_items # Fail open (return all) if client init fails
+        
+    screened_items = []
+    
+    # Process in batches of 20
+    batch_size = 20
+    for i in range(0, len(news_items), batch_size):
+        batch = news_items[i:i+batch_size]
+        
+        # Prepare context
+        titles_text = ""
+        for idx, item in enumerate(batch):
+            titles_text += f"{idx+1}. {item['title']} (Source: {item['source']})\n"
+            
+        keyword_str = ", ".join(keywords)
+        
+        system_prompt = (
+            f"You are a risk screening assistant. Your task is to screen news titles for potential negative news related to: {keyword_str}.\n"
+            "Criteria for KEEPING a title (Recall-oriented):\n"
+            "1. Mentions crime, scandal, regulation, lawsuit, fraud, corruption, or negative business events.\n"
+            "2. Ambiguous titles that MIGHT be negative.\n"
+            "3. Mentions specific individuals in a potentially negative context.\n\n"
+            "Criteria for DISCARDING:\n"
+            "1. Clearly positive news (awards, earnings growth, charity).\n"
+            "2. Generic market reports (stock prices up/down) without specific scandal.\n"
+            "3. Advertisements or promotional content.\n"
+            "4. Sports, entertainment, or lifestyle news unrelated to crime/fraud.\n\n"
+            "Output Format:\n"
+            "Return ONLY a JSON array of integers representing the indices (1-based) of the titles to KEEP.\n"
+            "Example: [1, 3, 5, 12]\n"
+            "If no titles are relevant, return []"
+        )
+        
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": titles_text}
+                ],
+                temperature=0.0 # Deterministic
+            )
+            
+            content = response.choices[0].message.content
+            
+            # Clean up markdown
+            if content.startswith("```json"):
+                content = content.replace("```json", "").replace("```", "")
+            elif content.startswith("```"):
+                content = content.replace("```", "")
+                
+            indices = json.loads(content)
+            
+            if isinstance(indices, list):
+                for idx in indices:
+                    if isinstance(idx, int) and 1 <= idx <= len(batch):
+                        screened_items.append(batch[idx-1])
+            
+        except Exception as e:
+            logging.error(f"Error during title screening batch {i}: {e}")
+            # If screening fails, keep the whole batch to be safe (Fail Open)
+            screened_items.extend(batch)
+            
+    logging.info(f"Screening complete. Kept {len(screened_items)} out of {len(news_items)} items.")
+    return screened_items
+
 def analyze_news(news_items, api_key, provider="Perplexity"):
     """
+    Phase 3: Deep Analysis.
     Analyzes a list of news items using specified LLM provider to extract criminal intelligence.
     
     Args:
         news_items (list): List of news item dictionaries.
         api_key (str): API Key for the selected provider.
-        provider (str): LLM provider name (Perplexity, OpenAI, Google Gemini, Meta Llama).
+        provider (str): LLM provider name.
         
     Returns:
         list: A list of dictionaries with enriched intelligence (names, summary).
@@ -108,42 +210,35 @@ def analyze_news(news_items, api_key, provider="Perplexity"):
             context_text += f"Source: {item['source']}\n"
             context_text += f"URL: {item['link']}\n"
             context_text += f"Date: {item['pub_date']}\n"
-            context_text += f"Content: {item.get('summary', '')} {item.get('full_text', '')[:500]}\n\n"
+            # Use full_text if available, otherwise summary
+            content_to_use = item.get('full_text', '')
+            if not content_to_use:
+                content_to_use = item.get('summary', '')
+            
+            # Truncate content to avoid token limits (though Perplexity has high limits)
+            context_text += f"Content: {content_to_use[:2000]}\n\n"
             
         system_prompt = (
-            "You are a professional criminal intelligence analyst. "
-            "Your task is to analyze the provided news articles, group them by specific events, and extract entities.\n\n"
-            "### Steps:\n"
-            "1. **Filter**: Ignore articles that are:\n"
-            "   - Not in Traditional Chinese (content is English or other languages).\n"
-            "   - Not news (e.g., forum discussions, ads, short invalid text).\n"
-            "   - If an article is ignored, do not include it in the output.\n\n"
-            "2. **Event Integration**:\n"
-            "   - Group articles that describe the **same specific criminal event** or case.\n"
-            "   - Combine information from all articles in the group.\n\n"
-            "3. **Entity Extraction (Strict)**:\n"
-            "   - Extract names of people involved in the event (suspects, perpetrators, victims if named).\n"
-            "   - **Criteria**:\n"
-            "     - MUST be a full name (e.g., '陳大文', 'Zhang San').\n"
-            "     - **STRICTLY EXCLUDE**: Single surnames ('陳先生'), fuzzy references ('某甲', '嫌犯'), titles ('檢察官').\n"
-            "     - **STRICTLY EXCLUDE**: Journalistic placeholders like 'Surname + Gender' (e.g., '陳男', '林女', '張姓男子', '林姓公務員').\n"
-            "     - If no valid names are found, return an empty list `[]`.\n\n"
-            "4. **Summarization**:\n"
-            "   - Write a fluent Traditional Chinese summary for the event group.\n"
-            "   - Limit: **Max 100 words**.\n"
-            "   - Focus on the key facts: Who, What, When, Where, Why.\n\n"
+            "You are an Adverse Media Analyst. Analyze the provided text. "
+            "Strictly verify two conditions:\n"
+            "1. Is the keyword/subject involved in a negative event?\n"
+            "2. Is the event genuinely negative/risky (scandal, crime, regulation, fraud, corruption)?\n\n"
+            "If NO to either, output 'IRRELEVANT' for that item (do not include it in the output list).\n"
+            "If YES, provide a concise summary and extract entities.\n\n"
             "### Output Format:\n"
             "Return a JSON array where each object represents a unique event:\n"
             "[\n"
             "  {\n"
             "    \"names\": [\"Name1\", \"Name2\"],\n"
-            "    \"summary\": \"Summary text...\",\n"
-            "    \"source_name\": \"Source Name (or Multiple)\",\n"
-            "    \"source_url\": \"URL of the most representative article\"\n"
+            "    \"summary\": \"Concise summary of the adverse event...\",\n"
+            "    \"source_name\": \"Source Name\",\n"
+            "    \"source_url\": \"URL\"\n"
             "  }\n"
             "]\n"
-            "IMPORTANT: Only include items where at least one COMPLETE person name is identified.\n"
-            "Output ONLY valid JSON."
+            "IMPORTANT:\n"
+            "- Only include items where at least one COMPLETE person name is identified.\n"
+            "- STRICTLY EXCLUDE: Journalistic placeholders like 'Surname + Gender' (e.g., '陳男', '林女').\n"
+            "- Output ONLY valid JSON."
         )
         
         try:
@@ -166,7 +261,10 @@ def analyze_news(news_items, api_key, provider="Perplexity"):
             
             # Log the raw content for debugging
             logging.debug(f"API Response: {content[:500]}")
-                
+            
+            if "IRRELEVANT" in content and len(content) < 20:
+                continue
+
             parsed_data = json.loads(content)
             
             # If the API returns a single object instead of a list, wrap it
@@ -194,6 +292,6 @@ def analyze_news(news_items, api_key, provider="Perplexity"):
         except Exception as e:
             logging.error(f"Error calling {provider} API: {e}")
             logging.error(f"Full error details: {str(e)}")
-            raise
+            # Don't raise, just log and continue to next batch
             
     return results

@@ -1,18 +1,20 @@
 import requests
-from bs4 import BeautifulSoup
 import urllib.parse
 import time
 import logging
 from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 import concurrent.futures
+import trafilatura
+from bs4 import BeautifulSoup
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def fetch_news(keywords, start_date, end_date):
+def fetch_rss_items(keywords, start_date, end_date):
     """
-    Fetches news from Google News RSS for the given keywords within a date range.
+    Phase 1: Fetches news titles/metadata from Google News RSS.
+    Does NOT fetch full content.
     
     Args:
         keywords (list): List of keywords to search for.
@@ -20,9 +22,9 @@ def fetch_news(keywords, start_date, end_date):
         end_date (date): End date for the search.
         
     Returns:
-        list: A list of dictionaries containing news details.
+        list: A list of dictionaries containing news metadata (title, link, pub_date, source, summary).
     """
-    all_news = []
+    all_items = []
     
     # Base URL for Google News RSS
     base_url = "https://news.google.com/rss/search"
@@ -32,21 +34,14 @@ def fetch_news(keywords, start_date, end_date):
     }
 
     # Format dates for query (YYYY-MM-DD)
-    # Note: Google News 'before:' operator is EXCLUSIVE, so we need to add 1 day to make it inclusive
     after_str = start_date.strftime("%Y-%m-%d")
-    # Add 1 day to end_date to make the range inclusive
     end_date_inclusive = end_date + timedelta(days=1)
     before_str = end_date_inclusive.strftime("%Y-%m-%d")
 
     for keyword in keywords:
         try:
-            logging.info(f"Fetching news for keyword: {keyword}")
+            logging.info(f"Fetching RSS for keyword: {keyword}")
             
-            # Construct query with date range operators
-            # Note: 'before' is exclusive in some contexts, but for search it usually includes the day or up to it.
-            # To be safe for inclusive range, we might want to set before to end_date + 1 day, 
-            # but standard search usually treats it as inclusive of the date provided or up to the next.
-            # Let's stick to the user provided dates first.
             query = f"{keyword} after:{after_str} before:{before_str}"
             params = {
                 "q": query,
@@ -62,7 +57,7 @@ def fetch_news(keywords, start_date, end_date):
             root = ET.fromstring(response.content)
             
             items = root.findall(".//item")
-            logging.info(f"Found {len(items)} items for {keyword}")
+            logging.info(f"Found {len(items)} RSS items for {keyword}")
             
             for item in items:
                 title = item.find("title").text if item.find("title") is not None else "No Title"
@@ -72,7 +67,7 @@ def fetch_news(keywords, start_date, end_date):
                 source = item.find("source").text if item.find("source") is not None else "Unknown"
                 
                 # Basic deduplication based on link
-                if any(n['link'] == link for n in all_news):
+                if any(n['link'] == link for n in all_items):
                     continue
                     
                 news_item = {
@@ -82,116 +77,104 @@ def fetch_news(keywords, start_date, end_date):
                     "pub_date": pub_date,
                     "source": source,
                     "summary": description, # Initial summary from RSS
-                    "full_text": "" # To be populated if possible
+                    "full_text": "" # To be populated in Phase 2
                 }
                 
-                all_news.append(news_item)
+                all_items.append(news_item)
                 
             # Be nice to the server
             time.sleep(1)
             
         except Exception as e:
-            logging.error(f"Error fetching news for {keyword}: {e}")
+            logging.error(f"Error fetching RSS for {keyword}: {e}")
             
+    return all_items
+
+def fetch_content_batch(news_items):
+    """
+    Phase 2: Fetches full content for a list of news items using Trafilatura.
+    
+    Args:
+        news_items (list): List of news item dictionaries (filtered from Phase 1).
+        
+    Returns:
+        list: The same list with 'full_text' populated. Items where fetch failed or content is too short might be filtered out or marked.
+    """
+    logging.info(f"Starting content fetch for {len(news_items)} items...")
+    
     # Use ThreadPoolExecutor for concurrent content fetching
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        # Create a dictionary to map futures to news items
-        future_to_item = {
-            executor.submit(extract_article_content, item['link']): item 
-            for item in all_news
-        }
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_item = {executor.submit(extract_content_trafilatura, item['link']): item for item in news_items}
         
         for future in concurrent.futures.as_completed(future_to_item):
             item = future_to_item[future]
             try:
-                full_text = future.result()
-                item['full_text'] = full_text
+                content = future.result()
+                if content and len(content) > 50:
+                    item['full_text'] = content
+                else:
+                    # Fallback to summary
+                    logging.warning(f"Using summary fallback for {item['title']}")
+                    summary = item.get('summary', '')
+                    # Clean summary HTML
+                    if summary:
+                        soup = BeautifulSoup(summary, "html.parser")
+                        item['full_text'] = soup.get_text()
+                    else:
+                        item['full_text'] = item['title'] # Last resort
             except Exception as e:
-                logging.error(f"Concurrency error for {item['link']}: {e}")
-                item['full_text'] = "Failed to fetch"
+                logging.error(f"Error fetching content for {item['title']}: {e}")
+                item['full_text'] = item.get('summary', '') or item['title']
 
-    return all_news
+    # Filter out items that are still empty (should be rare now)
+    valid_items = [item for item in news_items if item['full_text']]
+    logging.info(f"Content fetch complete. {len(valid_items)} valid items retained out of {len(news_items)}.")
+    return valid_items
 
-def extract_article_content(url):
+def extract_content_trafilatura(url):
     """
-    Attempts to extract the main content from a news article URL.
-    Note: Google News links are redirects. Requests handles redirects automatically.
-    Uses improved heuristics to extract only article body content.
+    Extracts main content using Trafilatura.
+    Uses requests to fetch HTML first to handle Google News redirects and User-Agent.
     """
     try:
+        # Use requests to fetch the page (handles redirects automatically)
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
+        logging.info(f"Fetched {url} -> {response.url} (Status: {response.status_code})")
         
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Remove non-content elements
-        for element in soup(["script", "style", "nav", "footer", "header", "aside", 
-                            "iframe", "noscript", "form"]):
-            element.decompose()
-        
-        # Remove common ad and navigation containers
-        for class_name in ['advertisement', 'ad-', 'sidebar', 'related', 'comments', 
-                          'social-share', 'navigation', 'menu', 'footer', 'header']:
-            for element in soup.find_all(class_=lambda x: x and class_name in x.lower()):
-                element.decompose()
-        
-        # Try to find the main article content using semantic HTML tags
-        article_content = None
-        
-        # Priority 1: Look for <article> tag
-        article_tag = soup.find('article')
-        if article_tag:
-            article_content = article_tag
-        
-        # Priority 2: Look for <main> tag
-        if not article_content:
-            main_tag = soup.find('main')
-            if main_tag:
-                article_content = main_tag
-        
-        # Priority 3: Look for divs with article-related classes
-        if not article_content:
-            for class_pattern in ['article', 'content', 'post', 'story', 'entry']:
-                content_div = soup.find('div', class_=lambda x: x and class_pattern in x.lower())
-                if content_div:
-                    article_content = content_div
-                    break
-        
-        # Extract text from the identified article content or fall back to body
-        if article_content:
-            # Get all paragraphs from the article content
-            paragraphs = article_content.find_all('p')
-            text_parts = [p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 30]
-            text = ' '.join(text_parts)
-        else:
-            # Fallback: get all paragraphs from the entire page
-            paragraphs = soup.find_all('p')
-            text_parts = [p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 30]
-            text = ' '.join(text_parts)
-        
-        # If still no text, fallback to all text
-        if not text:
-            text = soup.get_text(separator=' ', strip=True)
-        
-        if not text:
-            return "Failed to fetch"
-            
-        # Return up to 5000 characters
-        return text[:5000] 
-        
+        # Extract content from the HTML
+        result = trafilatura.extract(response.content, include_comments=False, include_tables=False, no_fallback=False)
+        if not result:
+            logging.warning(f"Trafilatura returned empty result for {response.url}")
+        if result:
+            return result
+        return ""
     except Exception as e:
         logging.error(f"Error extracting content from {url}: {e}")
-        return "Failed to fetch"
+        return ""
+
+# Legacy function wrapper for backward compatibility if needed (though we should update app.py)
+def fetch_news(keywords, start_date, end_date):
+    items = fetch_rss_items(keywords, start_date, end_date)
+    return fetch_content_batch(items)
 
 if __name__ == "__main__":
     # Test run
     test_keywords = ["詐騙"]
     today = datetime.now().date()
     start_date = today - timedelta(days=1)
-    news = fetch_news(test_keywords, start_date, today)
-    print(f"Fetched {len(news)} items.")
-    if news:
-        print("First item:", news[0])
+    
+    print("Phase 1: Fetching RSS...")
+    rss_items = fetch_rss_items(test_keywords, start_date, today)
+    print(f"Fetched {len(rss_items)} RSS items.")
+    
+    if rss_items:
+        print("Phase 2: Fetching Content for top 3 items...")
+        # Test with just a few
+        content_items = fetch_content_batch(rss_items[:3])
+        for item in content_items:
+            print(f"\nTitle: {item['title']}")
+            print(f"Content Length: {len(item['full_text'])}")
+            print(f"Preview: {item['full_text'][:100]}...")

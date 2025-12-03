@@ -60,9 +60,20 @@ if 'available_keywords' not in st.session_state:
         st.session_state.available_keywords = stored_keywords
     else:
         st.session_state.available_keywords = [
-            "貪污", "詐騙", "洗錢", "制裁", "證交法", 
-            "洗錢防制法", "販毒", "人口販運", "走私", 
-            "內線", "刑法", "詐貸", "詐欺", "駭入"
+            "販毒", "毒品", "製毒", "運毒",
+            "詐貸", "詐欺", "詐騙集團", "車手", "水房", "假投資", "假交友",
+            "逃稅", "漏稅", "逃漏稅", 
+            "賭博罪", "地下賭場", "線上博弈",
+            "黑幫", "幫派", "組織犯罪",
+            "走私", "私煙", "私酒", "私藥", "偽藥",
+            "貪污", "收賄", "圖利", "貪腐",
+            "侵佔", "挪用", "掏空",
+            "人口販運", "人口販賣",
+            "洗錢", "制裁", "資恐",
+            "證交法", "洗錢防制法", "刑法", "廢棄物清理法", "食安法",
+            "內線", "虛擬貨幣",
+
+
         ]
 if 'selected_keywords' not in st.session_state:
     st.session_state.selected_keywords = st.session_state.available_keywords.copy()
@@ -236,8 +247,8 @@ if start_btn:
     if not final_keywords:
         st.warning("Please select or enter at least one keyword.")
     else:
-        st.subheader("1. News Aggregation")
-        status_container = st.status("Scanning news sources...", expanded=True)
+        st.subheader("1. News Aggregation & Screening")
+        status_container = st.status("Starting scan...", expanded=True)
         progress_bar = st.progress(0)
         
         all_news_items = []
@@ -250,35 +261,76 @@ if start_btn:
             start_date = date_range
             end_date = date_range
 
+        # Phase 1: Global Collection
+        master_rss_items = []
+        
         for idx, keyword in enumerate(final_keywords):
             # Check for stop signal
             if st.session_state.stop_scan:
-                status_container.update(label="Scanning stopped by user.", state="error")
-                st.warning("Scan stopped by user.")
                 break
                 
-            status_container.write(f"Scanning for '{keyword}'...")
-            
+            # Phase 1: RSS Fetching
+            status_container.write(f"抓取關鍵字 : {keyword} ...")
             try:
-                news = scraper_web.fetch_news([keyword], start_date=start_date, end_date=end_date)
+                rss_items = scraper_web.fetch_rss_items([keyword], start_date=start_date, end_date=end_date)
                 
                 # Filter: Must have Chinese characters in title
-                filtered_news = [n for n in news if has_chinese(n['title'])]
-                all_news_items.extend(filtered_news)
+                rss_items = [n for n in rss_items if has_chinese(n['title'])]
+                
+                status_container.write(f"已完成 關鍵字抓取: {keyword} (共抓取 {len(rss_items)} 篇)")
+                master_rss_items.extend(rss_items)
                 
             except Exception as e:
                 st.error(f"Error scanning {keyword}: {e}")
             
-            # Update progress
-            progress = (idx + 1) / len(final_keywords)
+            # Update progress (Phase 1 accounts for 50% of progress)
+            progress = (idx + 1) / len(final_keywords) * 0.5
             progress_bar.progress(progress)
+
+        # Deduplicate Master List
+        unique_items = []
+        seen_links = set()
+        for item in master_rss_items:
+            if item['link'] not in seen_links:
+                unique_items.append(item)
+                seen_links.add(item['link'])
+        
+        status_container.write(f"全域抓取完成。共收集 {len(unique_items)} 篇新聞。")
+        
+        if not st.session_state.stop_scan and unique_items:
+            # Phase 1.5: Global Batch Screening
+            if api_key:
+                status_container.write(f"正在進行全域篩選 (共 {len(unique_items)} 篇)...")
+                screened_items = llm_service.screen_titles(
+                    unique_items, 
+                    final_keywords, 
+                    api_key, 
+                    provider=st.session_state.llm_provider
+                )
+                status_container.write(f"全域篩選完成。保留 {len(screened_items)} 篇新聞。")
+            else:
+                status_container.write(f"跳過篩選 (無 API Key)。保留 {len(unique_items)} 篇。")
+                screened_items = unique_items
+            
+            progress_bar.progress(0.75)
+            
+            if screened_items:
+                # Phase 2: Global Content Fetching
+                status_container.write(f"正在全域下載內文 (共 {len(screened_items)} 篇)...")
+                all_news_items = scraper_web.fetch_content_batch(screened_items)
+                status_container.write(f"全域內文下載完成。")
+                progress_bar.progress(1.0)
+            else:
+                all_news_items = []
+        else:
+            all_news_items = unique_items # If stopped or empty, just keep what we have (though content might be missing)
             
         # Handle stop scan scenario
         if st.session_state.stop_scan:
             status_container.update(label="Scanning stopped by user.", state="error")
             st.session_state.scraped_news = all_news_items
-            st.session_state.scan_completed = True # Treat partial scan as completed for display purposes
-            st.session_state.show_aggregation = True # Show what we found so far
+            st.session_state.scan_completed = True 
+            st.session_state.show_aggregation = True 
             
             if not all_news_items:
                 st.warning("No relevant news found (scan stopped).")
@@ -286,7 +338,7 @@ if start_btn:
                 st.success(f"Found {len(all_news_items)} relevant news items (scan stopped).")
                 
         elif not st.session_state.stop_scan:
-            status_container.update(label="Scraping complete!", state="complete", expanded=False)
+            status_container.update(label="Scraping & Screening complete!", state="complete", expanded=True)
             st.session_state.scraped_news = all_news_items
             st.session_state.scan_completed = True  # Mark scan as completed
             st.session_state.show_aggregation = True  # Show aggregation permanently
@@ -296,12 +348,12 @@ if start_btn:
             else:
                 st.success(f"Found {len(all_news_items)} relevant news items.")
                 
-        # Rerun to refresh the UI and show the persistent section instead of the temporary one
-        st.rerun()
+        # Rerun removed to keep logs visible
+        # st.rerun()
 
 # Display News Aggregation section when it should be shown (Persistent Section)
 # We only show this if we are NOT currently running a new scan (start_btn is False)
-if st.session_state.show_aggregation and st.session_state.scan_completed and not start_btn:
+if st.session_state.show_aggregation and st.session_state.scan_completed:
     st.subheader("1. News Aggregation")
     st.success(f"Found {len(st.session_state.scraped_news)} relevant news items.")
     
@@ -485,4 +537,4 @@ if st.session_state.analysis_results:
 
 # Footer
 st.markdown("---")
-st.markdown("© 2025 Tiara😘 | Powered by Streamlit ")
+st.markdown("© 2025 😘 | 美麗又大方的珍妮佛 ")
