@@ -537,4 +537,4 @@ if st.session_state.analysis_results:
 
 # Footer
 st.markdown("---")
-st.markdown("© 2025 😘 | 美麗又大方的珍妮佛 ")
+st.markdown("Sophistication, radiance and elegance | Jennifer")
