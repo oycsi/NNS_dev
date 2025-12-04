@@ -72,8 +72,6 @@ if 'available_keywords' not in st.session_state:
             "洗錢", "制裁", "資恐",
             "證交法", "洗錢防制法", "刑法", "廢棄物清理法", "食安法",
             "內線", "虛擬貨幣",
-
-
         ]
 if 'selected_keywords' not in st.session_state:
     st.session_state.selected_keywords = st.session_state.available_keywords.copy()
@@ -93,6 +91,69 @@ def has_chinese(text):
     if not text:
         return False
     return bool(re.search(r'[\u4e00-\u9fff]', text))
+
+# Helper function for Excel export
+def to_excel(df):
+    try:
+        output = io.BytesIO()
+        # Use default engine (usually openpyxl) to avoid compatibility issues
+        with pd.ExcelWriter(output) as writer:
+            df.to_excel(writer, index=False, sheet_name='Sheet1')
+            workbook = writer.book
+            worksheet = writer.sheets['Sheet1']
+            for i, col in enumerate(df.columns):
+                # Handle potential non-string types for length calculation
+                try:
+                    max_len = df[col].astype(str).map(len).max()
+                    if pd.isna(max_len):
+                        max_len = 10
+                except:
+                    max_len = 10
+                column_len = max(max_len, len(str(col))) + 2
+                column_len = min(column_len, 72)
+                if hasattr(worksheet, 'set_column'):
+                    worksheet.set_column(i, i, column_len)
+        return output.getvalue()
+    except Exception as e:
+        print(f"Export error: {e}")
+        return None
+
+# Helper function to prepare Stage 1 export data (filter columns)
+def prepare_stage1_export_df(df):
+    """
+    準備 Stage 1 的匯出資料，只保留必要欄位。
+    """
+    required_columns = ['keyword', 'title', 'link', 'pub_date', 'source']
+    # Filter columns that exist in the dataframe
+    return df[[col for col in required_columns if col in df.columns]]
+
+# Helper function to process analysis results into DataFrame
+def process_results_to_df(results):
+    expanded_results = []
+    for result in results:
+        names = result.get('names', [])
+        if isinstance(names, str):
+            names = [names]
+        
+        # Create a row for each name
+        for name in names:
+            if name and name.strip():
+                expanded_results.append({
+                    "人物姓名": name.strip(),
+                    "新聞摘要": result.get('summary', ''),
+                    "資料來源": result.get('source_name', ''),
+                    "連結": result.get('source_url', ''),
+                    # Hidden fields for export
+                    "original_text_pattern": result.get('original_text_pattern', ''),
+                    "type": result.get('type', ''),
+                    "reason": result.get('reason', ''),
+                    "keyword": result.get('keyword', ''),
+                    "pub_date": result.get('pub_date', '')
+                })
+    
+    if expanded_results:
+        return pd.DataFrame(expanded_results)
+    return pd.DataFrame()
 
 # Title and Description (Custom HTML for alignment)
 st.markdown(
@@ -126,6 +187,9 @@ st.markdown(
 # Sidebar Configuration
 with st.sidebar:
     st.header("Configuration")
+    
+    # Debug Mode Toggle
+    debug_mode = st.checkbox("🛠️ Enable Debug Mode", value=False)
     
     # LLM Provider Selection
     llm_provider = st.selectbox(
@@ -235,23 +299,27 @@ with st.sidebar:
 
 # Main Logic
 
-# 1. Scraping Phase
+# Initialize workflow stage if not present
+if 'workflow_stage' not in st.session_state:
+    st.session_state.workflow_stage = 'config' # config, metadata_review, processing, completed
+
+# 1. Start Scan Button (Config Stage)
 if start_btn:
     st.session_state.scraped_news = [] # Reset on new scan
     st.session_state.analysis_results = []
     st.session_state.stop_scan = False
-    st.session_state.scan_completed = False  # Reset completion flag
-    st.session_state.show_aggregation = False  # Will be set to True after scan completes
-    st.session_state.show_analysis = False  # Reset analysis section
+    st.session_state.scan_completed = False
+    st.session_state.show_aggregation = False
+    st.session_state.show_analysis = False
+    st.session_state.workflow_stage = 'metadata_review' # Move to next stage
     
     if not final_keywords:
         st.warning("Please select or enter at least one keyword.")
+        st.session_state.workflow_stage = 'config' # Revert
     else:
-        st.subheader("1. News Aggregation & Screening")
-        status_container = st.status("Starting scan...", expanded=True)
-        progress_bar = st.progress(0)
-        
-        all_news_items = []
+        # Execute Stage 1: Metadata Fetching
+        st.subheader("Stage 1: Metadata Fetching")
+        status_container = st.status("Fetching metadata...", expanded=True)
         
         # Handle date range
         if isinstance(date_range, tuple):
@@ -261,241 +329,249 @@ if start_btn:
             start_date = date_range
             end_date = date_range
 
-        # Phase 1: Global Collection
-        master_rss_items = []
-        
-        for idx, keyword in enumerate(final_keywords):
-            # Check for stop signal
-            if st.session_state.stop_scan:
-                break
+        # Fetch RSS Items with Granular Progress
+        try:
+            all_rss_items = []
+            log_messages = []
+            
+            # Create UI elements for progress
+            progress_bar = st.progress(0)
+            log_container = st.empty() # For persistent logs
+            
+            total_keywords = len(final_keywords)
+            
+            for idx, keyword in enumerate(final_keywords):
+                # Update status
+                status_container.write(f"正在抓取 [{keyword}] 相關新聞... ({idx+1}/{total_keywords})")
                 
-            # Phase 1: RSS Fetching
-            status_container.write(f"抓取關鍵字 : {keyword} ...")
-            try:
+                # Fetch for single keyword
+                # We pass a list with one keyword to reuse the existing function
                 rss_items = scraper_web.fetch_rss_items([keyword], start_date=start_date, end_date=end_date)
                 
                 # Filter: Must have Chinese characters in title
                 rss_items = [n for n in rss_items if has_chinese(n['title'])]
                 
-                status_container.write(f"已完成 關鍵字抓取: {keyword} (共抓取 {len(rss_items)} 篇)")
-                master_rss_items.extend(rss_items)
+                # Add to master list
+                all_rss_items.extend(rss_items)
                 
-            except Exception as e:
-                st.error(f"Error scanning {keyword}: {e}")
+                # Update logs
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                if rss_items:
+                    log_msg = f"✅ [{timestamp}] [{keyword}] 抓取完成，共 {len(rss_items)} 篇。"
+                else:
+                    log_msg = f"⚠️ [{timestamp}] [{keyword}] 抓取完成，未發現相關新聞。"
+                
+                log_messages.append(log_msg)
+                
+                # Render logs (cumulative)
+                log_html = "<div style='height: 150px; overflow-y: auto; background-color: #f0f2f6; padding: 10px; border-radius: 5px; font-family: monospace; font-size: 0.8em;'>"
+                for msg in log_messages:
+                    color = "green" if "✅" in msg else "orange"
+                    log_html += f"<div style='color: {color}; margin-bottom: 4px;'>{msg}</div>"
+                log_html += "</div>"
+                
+                log_container.markdown(log_html, unsafe_allow_html=True)
+                
+                # Update progress
+                progress_bar.progress((idx + 1) / total_keywords)
+                
+                # Small delay to prevent rate limiting and allow UI update
+                time.sleep(0.5)
             
-            # Update progress (Phase 1 accounts for 50% of progress)
-            progress = (idx + 1) / len(final_keywords) * 0.5
-            progress_bar.progress(progress)
+            st.session_state.scraped_news = all_rss_items
+            status_container.update(label=f"Metadata fetch complete. Found {len(all_rss_items)} items.", state="complete", expanded=False)
+            
+        except Exception as e:
+            st.error(f"Error during metadata fetch: {e}")
+            st.session_state.workflow_stage = 'config'
 
-        # Deduplicate Master List
-        unique_items = []
-        seen_links = set()
-        for item in master_rss_items:
-            if item['link'] not in seen_links:
-                unique_items.append(item)
-                seen_links.add(item['link'])
-        
-        status_container.write(f"全域抓取完成。共收集 {len(unique_items)} 篇新聞。")
-        
-        if not st.session_state.stop_scan and unique_items:
-            # Phase 1.5: Global Batch Screening
-            if api_key:
-                status_container.write(f"正在進行全域篩選 (共 {len(unique_items)} 篇)...")
-                screened_items = llm_service.screen_titles(
-                    unique_items, 
-                    final_keywords, 
-                    api_key, 
-                    provider=st.session_state.llm_provider
-                )
-                status_container.write(f"全域篩選完成。保留 {len(screened_items)} 篇新聞。")
-            else:
-                status_container.write(f"跳過篩選 (無 API Key)。保留 {len(unique_items)} 篇。")
-                screened_items = unique_items
-            
-            progress_bar.progress(0.75)
-            
-            if screened_items:
-                # Phase 2: Global Content Fetching
-                status_container.write(f"正在全域下載內文 (共 {len(screened_items)} 篇)...")
-                all_news_items = scraper_web.fetch_content_batch(screened_items)
-                status_container.write(f"全域內文下載完成。")
-                progress_bar.progress(1.0)
-            else:
-                all_news_items = []
-        else:
-            all_news_items = unique_items # If stopped or empty, just keep what we have (though content might be missing)
-            
-        # Handle stop scan scenario
-        if st.session_state.stop_scan:
-            status_container.update(label="Scanning stopped by user.", state="error")
-            st.session_state.scraped_news = all_news_items
-            st.session_state.scan_completed = True 
-            st.session_state.show_aggregation = True 
-            
-            if not all_news_items:
-                st.warning("No relevant news found (scan stopped).")
-            else:
-                st.success(f"Found {len(all_news_items)} relevant news items (scan stopped).")
-                
-        elif not st.session_state.stop_scan:
-            status_container.update(label="Scraping & Screening complete!", state="complete", expanded=True)
-            st.session_state.scraped_news = all_news_items
-            st.session_state.scan_completed = True  # Mark scan as completed
-            st.session_state.show_aggregation = True  # Show aggregation permanently
-            
-            if not all_news_items:
-                st.warning("No relevant news found.")
-            else:
-                st.success(f"Found {len(all_news_items)} relevant news items.")
-                
-        # Rerun removed to keep logs visible
-        # st.rerun()
-
-# Display News Aggregation section when it should be shown (Persistent Section)
-# We only show this if we are NOT currently running a new scan (start_btn is False)
-if st.session_state.show_aggregation and st.session_state.scan_completed:
-    st.subheader("1. News Aggregation")
-    st.success(f"Found {len(st.session_state.scraped_news)} relevant news items.")
+# 2. Persistent Stage 1 Display (Metadata Review)
+# This block runs for 'metadata_review', 'processing', and 'completed' stages
+if st.session_state.workflow_stage != 'config' and st.session_state.scraped_news:
+    st.subheader("Stage 1: Raw Data Review")
     
-# Display Scraped Data & Action Buttons
-if st.session_state.scraped_news and st.session_state.scan_completed:
-    st.subheader("Raw Data Preview")
+    # Display Metadata DataFrame
+    df_metadata = pd.DataFrame(st.session_state.scraped_news)
     
-    # Export raw data button
-    raw_df = pd.DataFrame(st.session_state.scraped_news)
-    raw_output = io.BytesIO()
-    with pd.ExcelWriter(raw_output, engine='xlsxwriter') as writer:
-        raw_df.to_excel(writer, index=False, sheet_name='Raw Data')
-        
-        # Auto-adjust columns width with max 72
-        workbook = writer.book
-        worksheet = writer.sheets['Raw Data']
-        for i, col in enumerate(raw_df.columns):
-            column_len = max(raw_df[col].astype(str).map(len).max(), len(col)) + 2
-            column_len = min(column_len, 72)  # Cap at 72
-            worksheet.set_column(i, i, column_len)
+    # Ensure columns exist before selecting (in case of empty or malformed data)
+    available_cols = df_metadata.columns.tolist()
+    display_cols = [col for col in ['keyword', 'title', 'pub_date', 'source', 'link'] if col in available_cols]
     
-    raw_excel_data = raw_output.getvalue()
+    if display_cols:
+        st.dataframe(df_metadata[display_cols], use_container_width=True)
+    else:
+        st.dataframe(df_metadata, use_container_width=True) # Fallback
     
-    col_exp, col_export = st.columns([5, 1])
-    with col_exp:
-        with st.expander("View Scraped News", expanded=st.session_state.expander_state):
-            st.dataframe(raw_df)
-            # Track if user manually changed expander state
-            if st.session_state.expander_state != st.session_state.get('prev_expander_state', False):
-                st.session_state.prev_expander_state = st.session_state.expander_state
-    with col_export:
+    # Export Button for Stage 1
+    # Filter data for export
+    df_export_stage1 = prepare_stage1_export_df(df_metadata)
+    excel_data_stage1 = to_excel(df_export_stage1)
+    
+    if excel_data_stage1:
+        file_name_stage1 = f"negative_news_metadata_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         st.download_button(
-            label="Export",
-            data=raw_excel_data,
-            file_name=f"Raw_Data_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
+            label="📥 Export to Excel",
+            data=excel_data_stage1,
+            file_name=file_name_stage1,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="secondary"
+            key="download_stage1"
         )
+    
+    # Action Buttons (Only show in 'metadata_review' stage)
+    if st.session_state.workflow_stage == 'metadata_review':
+        st.info(f"Found {len(st.session_state.scraped_news)} potential items. Click 'Continue' to fetch content and analyze, or 'Reset' to start over.")
         
-    st.divider()
-    
-    col_analyze, col_reset = st.columns([1, 4])
-    
-    # Use a placeholder to manage button visibility
-    button_placeholder = st.empty()
-    
-    with button_placeholder.container():
-        col_btns = st.columns([1, 1])
-        with col_btns[0]:
-            continue_btn = st.button("Continue", type="primary", use_container_width=True)
-        with col_btns[1]:
-            reset_main_btn = st.button("Reset", type="secondary", use_container_width=True)
-        
-    if reset_main_btn:
-        st.session_state.scraped_news = []
-        st.session_state.analysis_results = []
-        st.session_state.is_scanning = False
-        st.session_state.stop_scan = False
-        st.session_state.scan_completed = False
-        st.session_state.show_aggregation = False
-        st.session_state.show_analysis = False
-        st.session_state.expander_state = False
+        col_cont, col_reset = st.columns([1, 1])
+        with col_cont:
+            if st.button("Continue (Fetch Content & Analyze)", type="primary", use_container_width=True):
+                st.session_state.workflow_stage = 'processing'
+                st.rerun()
+        with col_reset:
+            if st.button("Reset", type="secondary", use_container_width=True):
+                st.session_state.scraped_news = []
+                st.session_state.workflow_stage = 'config'
+                st.rerun()
+
+# Handle case where no items are found in metadata review
+if st.session_state.workflow_stage == 'metadata_review' and not st.session_state.scraped_news:
+    st.warning("No items found. Please try different keywords or date range.")
+    if st.button("Back to Config"):
+        st.session_state.workflow_stage = 'config'
         st.rerun()
+
+# 3. Stage 2: Content Fetching & Analysis
+if st.session_state.workflow_stage == 'processing':
+    st.divider() # Separator between table and processing status
+    st.markdown("## Stage 2: Content Fetching & Analysis") # Explicit Header
     
-    if continue_btn:
-        # Clear buttons to prevent duplication/clutter during analysis
-        button_placeholder.empty()
-        st.session_state.show_analysis = True  # Show analysis section
+    # Progress tracking
+    status_container = st.status("Processing...", expanded=True)
+    progress_bar = st.progress(0)
+    
+    try:
+        # Step 2: Sequential Fetch & Analyze with Progress
+        total_items = len(st.session_state.scraped_news)
+        # status_container.write(f"Starting processing for {total_items} items...")
         
+        results = []
+        processed_items = []
+        
+        # Check API Key first
         if not api_key:
-            st.error(f"Please enter your {st.session_state.llm_provider} API Key in the sidebar to proceed.")
+            st.error("Missing API Key. Cannot proceed with analysis.")
+            if st.button("Back to Config"):
+                st.session_state.workflow_stage = 'config'
+                st.rerun()
         else:
-            st.subheader("2. AI Intelligence Analysis")
-            with st.spinner(f"Analyzing content with {st.session_state.llm_provider}..."):
+            # Initialize Scrollable Log Container
+            log_container = st.empty()
+            logs = []
+            
+            def update_logs(message):
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                logs.append(f"[{timestamp}] {message}")
+                log_html = f"""
+                <div style="height: 300px; overflow-y: scroll; border: 1px solid #ccc; padding: 10px; background-color: #f9f9f9; font-family: monospace; font-size: 0.9em;">
+                    {'<br>'.join(logs)}
+                    <script>
+                        var objDiv = document.getElementById("log_container");
+                        objDiv.scrollTop = objDiv.scrollHeight;
+                    </script>
+                </div>
+                """
+                log_container.markdown(log_html, unsafe_allow_html=True)
+
+            for idx, item in enumerate(st.session_state.scraped_news):
                 try:
-                    # Run Analysis
-                    results = llm_service.analyze_news(
-                        st.session_state.scraped_news, 
+                    # Update Status & Logs
+                    current_progress = (idx + 1) / total_items
+                    status_message = f"Processing item {idx + 1}/{total_items}: {item['title']}..."
+                    # status_container.write(status_message)
+                    update_logs(status_message)
+                    progress_bar.progress(current_progress)
+                    
+                    # 2.1 Fetch Content (Single Item)
+                    item = scraper_web.fetch_content_single(item)
+                    processed_items.append(item)
+                    
+                    # 2.2 Analyze (Single Item)
+                    item_results, debug_info = llm_service.analyze_single_item(
+                        item, 
                         api_key,
                         provider=st.session_state.llm_provider
                     )
-                    st.session_state.analysis_results = results
-                    if not results:
-                        st.warning("Analysis completed but no valid events with named individuals were found.")
-                except json.JSONDecodeError as e:
-                    st.error(f"❌ Failed to parse {st.session_state.llm_provider} response. The API returned invalid JSON.")
-                    st.error(f"Error details: {str(e)}")
-                    if st.button("Retry", use_container_width=True, type="primary", key="retry_json"):
-                        st.rerun()
-                except openai.AuthenticationError:
-                    st.error(f"❌ Authentication failed. Please check your {st.session_state.llm_provider} API key.")
-                    if st.button("Retry", use_container_width=True, type="primary", key="retry_auth"):
-                        st.rerun()
-                except openai.RateLimitError:
-                    st.error(f"❌ Rate limit exceeded for {st.session_state.llm_provider}. Please wait and try again.")
-                    if st.button("Retry", use_container_width=True, type="primary", key="retry_rate"):
-                        st.rerun()
-                except openai.APIError as e:
-                    st.error(f"❌ {st.session_state.llm_provider} API error: {str(e)}")
-                    if st.button("Retry", use_container_width=True, type="primary", key="retry_api"):
-                        st.rerun()
+                    
+                    # Debug Inspector (Conditional Rendering)
+                    if debug_mode:
+                        with st.expander(f"🕵️ Debug: Check Input Content for '{item['title']}'"):
+                            st.markdown(f"**Method:** `{debug_info.get('scraping_method', 'Unknown')}`")
+                            st.markdown("### Input Text Preview")
+                            st.text(debug_info.get('input_content', 'No content')[:1000])
+                            st.markdown("### LLM Raw Response")
+                            st.code(debug_info.get('raw_response', 'No response'), language='json')
+                    
+                    if item_results:
+                        results.extend(item_results)
+                        update_logs(f"✅ Extracted {len(item_results[0]['names'])} entities from '{item['title']}'")
+                        
                 except Exception as e:
-                    st.error(f"❌ An unexpected error occurred during analysis: {str(e)}")
-                    st.error("Please check your API key and try again.")
-                    import traceback
-                    st.code(traceback.format_exc())
-                    if st.button("Retry", use_container_width=True, type="primary", key="retry_general"):
-                        st.rerun()
+                    error_msg = f"Error processing item {idx + 1}: {e}"
+                    st.error(error_msg)
+                    logging.error(f"Error in Stage 2 loop for item {item.get('title', 'Unknown')}: {e}")
+                    update_logs(f"❌ {error_msg}")
+                    continue
+                
+                # Small delay to allow UI update and prevent rate limits
+                # time.sleep(0.1) 
+            
+            # Update session state with fully fetched items
+            st.session_state.scraped_news = processed_items
+            st.session_state.analysis_results = results
+            
+            # Process and save DataFrame immediately
+            df_results = process_results_to_df(results)
+            st.session_state.analysis_results_df = df_results
+            
+            progress_bar.progress(1.0)
+            status_container.update(label="Analysis Complete!", state="complete", expanded=False)
+            
+            st.session_state.workflow_stage = 'completed'
+            st.rerun()
+            
+    except Exception as e:
+        st.error(f"An error occurred during processing: {str(e)}")
+        if st.button("Retry"):
+            st.rerun()
+        if st.button("Reset"):
+            st.session_state.workflow_stage = 'config'
+            st.rerun()
 
-# Display Analysis Section Header (persists when editing sidebar)
-if st.session_state.show_analysis:
-    if not st.session_state.analysis_results:
-        st.subheader("2. AI Intelligence Analysis")
-        st.info("Analysis in progress or encountered an error. Please check above.")
+# 4. Completed Stage (Results Display)
+if st.session_state.workflow_stage == 'completed':
+    st.divider()
+    st.markdown("## Stage 2: Content Fetching & Analysis") # Consistent Header
+    
+    # Show Aggregation Summary (Optional, reusing existing logic)
+    st.subheader("Analysis Complete")
+    
+    # Reset Button at the top for convenience
+    if st.button("Start New Scan", type="secondary"):
+        st.session_state.scraped_news = []
+        st.session_state.analysis_results = []
+        if 'analysis_results_df' in st.session_state:
+            del st.session_state['analysis_results_df']
+        st.session_state.workflow_stage = 'config'
+        st.rerun()
 
-# Display Analysis Results
-if st.session_state.analysis_results:
-    st.subheader("3. Intelligence Report")
-    
-    # Process results to expand names into separate rows
-    expanded_results = []
-    for result in st.session_state.analysis_results:
-        names = result.get('names', [])
-        if isinstance(names, str):
-            names = [names]
+    # Display Analysis Results
+    if 'analysis_results_df' in st.session_state and not st.session_state.analysis_results_df.empty:
+        st.subheader("3. Intelligence Report")
         
-        # Create a row for each name
-        for name in names:
-            if name and name.strip():
-                expanded_results.append({
-                    "人物姓名": name.strip(),
-                    "新聞摘要": result.get('summary', ''),
-                    "資料來源": result.get('source_name', ''),
-                    "連結": result.get('source_url', '')
-                })
-    
-    if expanded_results:
-        df_display = pd.DataFrame(expanded_results)
+        df_display = st.session_state.analysis_results_df
         
-        # Display Data Grid with Link
+        # Display Data Grid with Link (Subset of columns)
         st.data_editor(
-            df_display,
+            df_display[["人物姓名", "新聞摘要", "資料來源", "連結"]],
             column_config={
                 "連結": st.column_config.LinkColumn(
                     "原始連結",
@@ -510,30 +586,20 @@ if st.session_state.analysis_results:
             hide_index=True
         )
         
-        # Excel Export
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df_display.to_excel(writer, index=False, sheet_name='Intelligence Report')
+        # Excel Export for Stage 2
+        excel_data_stage2 = to_excel(df_display)
+        if excel_data_stage2:
+            file_name_stage2 = f"negative_news_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             
-            # Auto-adjust columns width with max 72
-            workbook = writer.book
-            worksheet = writer.sheets['Intelligence Report']
-            for i, col in enumerate(df_display.columns):
-                column_len = max(df_display[col].astype(str).map(len).max(), len(col)) + 2
-                column_len = min(column_len, 72)  # Cap at 72
-                worksheet.set_column(i, i, column_len)
-                
-        excel_data = output.getvalue()
-        file_name = f"新阿姆斯特朗旋風噴射阿姆斯特朗砲_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
-        
-        st.download_button(
-            label="Download Excel Report",
-            data=excel_data,
-            file_name=file_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+            st.download_button(
+                label="📥 Export Analysis Results to Excel",
+                data=excel_data_stage2,
+                file_name=file_name_stage2,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_stage2"
+            )
     else:
-        st.info("Analysis complete, but no specific named individuals were found in the negative news.")
+        st.info("Analysis complete. No negative news entities were found.")
 
 # Footer
 st.markdown("---")

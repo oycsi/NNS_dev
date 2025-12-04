@@ -104,7 +104,7 @@ def fetch_content_batch(news_items):
     
     # Use ThreadPoolExecutor for concurrent content fetching
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_item = {executor.submit(extract_content_trafilatura, item['link']): item for item in news_items}
+        future_to_item = {executor.submit(fetch_full_content, item['link']): item for item in news_items}
         
         for future in concurrent.futures.as_completed(future_to_item):
             item = future_to_item[future]
@@ -131,29 +131,86 @@ def fetch_content_batch(news_items):
     logging.info(f"Content fetch complete. {len(valid_items)} valid items retained out of {len(news_items)}.")
     return valid_items
 
-def extract_content_trafilatura(url):
+def fetch_content_single(item):
     """
-    Extracts main content using Trafilatura.
-    Uses requests to fetch HTML first to handle Google News redirects and User-Agent.
+    Fetches content for a single news item.
+    Updates the item dictionary in-place with 'full_text'.
     """
     try:
-        # Use requests to fetch the page (handles redirects automatically)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        logging.info(f"Fetched {url} -> {response.url} (Status: {response.status_code})")
-        
-        # Extract content from the HTML
-        result = trafilatura.extract(response.content, include_comments=False, include_tables=False, no_fallback=False)
-        if not result:
-            logging.warning(f"Trafilatura returned empty result for {response.url}")
-        if result:
-            return result
-        return ""
+        content = fetch_full_content(item['link'])
+        if content and len(content) > 50:
+            item['full_text'] = content
+        else:
+            # Fallback to summary
+            logging.warning(f"Using summary fallback for {item['title']}")
+            summary = item.get('summary', '')
+            # Clean summary HTML
+            if summary:
+                soup = BeautifulSoup(summary, "html.parser")
+                item['full_text'] = soup.get_text()
+            else:
+                item['full_text'] = item['title'] # Last resort
     except Exception as e:
-        logging.error(f"Error extracting content from {url}: {e}")
-        return ""
+        logging.error(f"Error fetching content for {item['title']}: {e}")
+        item['full_text'] = item.get('summary', '') or item['title']
+    return item
+
+def decode_google_news_url(url):
+    """
+    Attempts to decode Google News URLs to get the final destination.
+    Uses requests.head with allow_redirects=True.
+    """
+    try:
+        # Mimic a real browser to encourage Google to redirect
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+        }
+        response = requests.head(url, allow_redirects=True, headers=headers, timeout=10)
+        return response.url
+    except Exception as e:
+        logging.warning(f"Failed to decode Google News URL {url}: {e}")
+        return url
+
+def fetch_full_content(url):
+    """
+    Robust content fetching using Trafilatura with Requests fallback.
+    Handles Google News redirects.
+    """
+    try:
+        # 1. Decode Google News URL if necessary
+        if "news.google.com" in url:
+            final_url = decode_google_news_url(url)
+            logging.info(f"Decoded URL: {url} -> {final_url}")
+        else:
+            final_url = url
+
+        # Method 1: Trafilatura (Best for news extraction)
+        downloaded = trafilatura.fetch_url(final_url)
+        if downloaded:
+            text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
+            if text and len(text) > 50:
+                logging.info(f"Trafilatura fetch success for {final_url}")
+                return text
+
+        # Method 2: Requests + Trafilatura (Custom Headers)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+        }
+        response = requests.get(final_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        # Try extracting from raw HTML
+        text = trafilatura.extract(response.text)
+        if text and len(text) > 50:
+            logging.info(f"Requests+Trafilatura success for {final_url}")
+            return text
+            
+        logging.warning(f"Failed to extract meaningful content from {final_url}")
+        return None # Failed to extract meaningful content
+        
+    except Exception as e:
+        logging.error(f"Error fetching content from {url}: {e}")
+        return None
 
 # Legacy function wrapper for backward compatibility if needed (though we should update app.py)
 def fetch_news(keywords, start_date, end_date):
@@ -166,12 +223,12 @@ if __name__ == "__main__":
     today = datetime.now().date()
     start_date = today - timedelta(days=1)
     
-    print("Phase 1: Fetching RSS...")
+    print("Fetching RSS...")
     rss_items = fetch_rss_items(test_keywords, start_date, today)
     print(f"Fetched {len(rss_items)} RSS items.")
     
     if rss_items:
-        print("Phase 2: Fetching Content for top 3 items...")
+        print("Fetching Content for top 3 items...")
         # Test with just a few
         content_items = fetch_content_batch(rss_items[:3])
         for item in content_items:

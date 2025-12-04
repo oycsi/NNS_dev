@@ -197,61 +197,74 @@ def analyze_news(news_items, api_key, provider="Perplexity"):
     
     results = []
     
-    # Process in batches
-    batch_size = 5
-    for i in range(0, len(news_items), batch_size):
-        batch = news_items[i:i+batch_size]
+    # Process items one by one to ensure strict adherence to the complex prompt
+    for i, item in enumerate(news_items):
+        # Prepare content
+        content_to_use = item.get('full_text', '')
+        if not content_to_use:
+            content_to_use = item.get('summary', '')
+            
+        # Skip if content is too short
+        if len(content_to_use) < 50:
+            continue
+
+        # Truncate content if necessary (Perplexity has high limits, but good practice)
+        content_to_use = content_to_use[:10000] 
         
-        # Prepare context for the LLM
-        context_text = ""
-        for idx, item in enumerate(batch):
-            context_text += f"News Item {idx+1}:\n"
-            context_text += f"Title: {item['title']}\n"
-            context_text += f"Source: {item['source']}\n"
-            context_text += f"URL: {item['link']}\n"
-            context_text += f"Date: {item['pub_date']}\n"
-            # Use full_text if available, otherwise summary
-            content_to_use = item.get('full_text', '')
-            if not content_to_use:
-                content_to_use = item.get('summary', '')
-            
-            # Truncate content to avoid token limits (though Perplexity has high limits)
-            context_text += f"Content: {content_to_use[:2000]}\n\n"
-            
         system_prompt = (
-            "You are an Adverse Media Analyst. Analyze the provided text. "
-            "Strictly verify two conditions:\n"
-            "1. Is the keyword/subject involved in a negative event?\n"
-            "2. Is the event genuinely negative/risky (scandal, crime, regulation, fraud, corruption)?\n\n"
-            "If NO to either, output 'IRRELEVANT' for that item (do not include it in the output list).\n"
-            "If YES, provide a concise summary and extract entities.\n\n"
-            "### Output Format:\n"
-            "Return a JSON array where each object represents a unique event:\n"
-            "[\n"
-            "  {\n"
-            "    \"names\": [\"Name1\", \"Name2\"],\n"
-            "    \"summary\": \"Concise summary of the adverse event...\",\n"
-            "    \"source_name\": \"Source Name\",\n"
-            "    \"source_url\": \"URL\"\n"
-            "  }\n"
-            "]\n"
-            "IMPORTANT:\n"
-            "- Only include items where at least one COMPLETE person name is identified.\n"
-            "- STRICTLY EXCLUDE: Journalistic placeholders like 'Surname + Gender' (e.g., '陳男', '林女').\n"
-            "- Output ONLY valid JSON."
+            "# Role: Negative News Entity Extractor (負面新聞實體提取專家)\n\n"
+            "# Objective:\n"
+            "分析輸入的新聞文本，根據上下文邏輯，精準提取「負面新聞主角（犯罪嫌疑人、違法者）」的姓名或代稱。\n\n"
+            "# Constraints & Guidelines:\n\n"
+            "1.  **Language Filter (語言過濾):**\n"
+            "    - 僅處理「繁體中文」或「簡體中文」內容。\n"
+            "    - 若新聞內容主要為非中文（如英文、日文等），請直接回傳空結果，標註 \"non-chinese\"。\n\n"
+            "2.  **Target Entity Definition (目標實體定義):**\n"
+            "    - 僅提取新聞事件中「涉嫌犯罪」、「違法」、「被捕」、「被起訴」或「負面行為實施者」的人物。\n"
+            "    - **嚴格排除**：執法人員（警察、檢察官）、受害者、無辜路人、律師、單純受訪者。\n\n"
+            "3.  **Naming Convention Handling (特殊命名處理):**\n"
+            "    - 必須識別並提取中文新聞特有的匿名或代稱格式，包括但不限於：\n"
+            "      - 「X姓XX」（如：陳姓男子、林姓主嫌）\n"
+            "      - 「X某」（如：張某）\n"
+            "      - 「X男」、「X女」（如：李男、王女）\n"
+            "      - 「X員」（如：陳員 - *需注意上下文，若是警員則排除，若是詐騙集團成員則提取*）\n"
+            "      - 「X嫌」（如：劉嫌）\n"
+            "      - 「X歲XX」（如：20歲林男）\n"
+            "      - 「X姓」（如：黃姓）\n"
+            "    - 若同一人在文中同時出現「全名」與「代稱」，優先提取「全名」。\n\n"
+            "4.  **Contextual Logic (上下文邏輯 - 核心要求):**\n"
+            "    - 必須閱讀整段文字來判斷角色關係。\n"
+            "    - 範例邏輯：\n"
+            "      - 句子：「警員**王大明**逮捕了涉嫌詐欺的**陳小華**。」 -> 提取：**陳小華** (排除王大明)。\n"
+            "      - 句子：「**李男**因酒駕撞傷了路人**張女**。」 -> 提取：**李男** (排除張女)。\n\n"
+            "# Output Format (JSON):\n"
+            "請僅回傳符合以下 JSON Schema 的純 JSON 字串，不要包含 Markdown 代碼塊或其他解釋文字：\n\n"
+            "{\n"
+            "  \"status\": \"success\",  // 或 \"skipped_non_chinese\"\n"
+            "  \"extracted_entities\": [\n"
+            "    {\n"
+            "      \"name\": \"提取到的名稱或代稱\",\n"
+            "      \"original_text_pattern\": \"原文中出現的形式 (如：陳某)\",\n"
+            "      \"type\": \"full_name\" | \"alias\", // 全名 或 代稱\n"
+            "      \"reason\": \"簡短說明為何認定此人為負面人物 (例如：涉嫌詐欺、被警方逮捕)\"\n"
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            "# Input Text:\n"
+            f"{content_to_use}"
         )
         
         try:
             response = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": context_text}
+                    {"role": "user", "content": system_prompt} # Using user role for the whole prompt as it includes input
                 ],
+                temperature=0.0
             )
             
             content = response.choices[0].message.content
-            logging.info(f"Received response from {provider}")
+            # logging.info(f"Received response from {provider} for item {i+1}")
             
             # Clean up markdown code blocks if present
             if content.startswith("```json"):
@@ -259,39 +272,184 @@ def analyze_news(news_items, api_key, provider="Perplexity"):
             elif content.startswith("```"):
                 content = content.replace("```", "")
             
-            # Log the raw content for debugging
-            logging.debug(f"API Response: {content[:500]}")
-            
-            if "IRRELEVANT" in content and len(content) < 20:
-                continue
-
             parsed_data = json.loads(content)
             
-            # If the API returns a single object instead of a list, wrap it
-            if isinstance(parsed_data, dict):
-                parsed_data = [parsed_data]
-            
-            # Filter and validate results
-            for item in parsed_data:
-                names = item.get('names', [])
-                
-                # Handle if names is a string (comma-separated) instead of array
-                if isinstance(names, str):
-                    names = [n.strip() for n in names.split(',')]
-                
-                # Filter for complete names only
-                complete_names = [n for n in names if is_complete_name(n)]
-                
-                if complete_names:
-                    item['names'] = complete_names  # Store as array
-                    results.append(item)
+            if parsed_data.get("status") == "success":
+                entities = parsed_data.get("extracted_entities", [])
+                if entities:
+                    # Map to the format expected by app.py
+                    names = [e['name'] for e in entities if e.get('name')]
+                    
+                    # Construct a summary from reasons
+                    reasons = [f"{e['name']}: {e['reason']}" for e in entities if e.get('name') and e.get('reason')]
+                    summary = "; ".join(reasons)
+                    
+                    if not summary:
+                        summary = item.get('title', 'No summary available')
+
+                    if names:
+                        results.append({
+                            "names": names,
+                            "summary": summary,
+                            "source_name": item['source'],
+                            "source_url": item['link']
+                        })
             
         except json.JSONDecodeError as e:
             logging.error(f"Failed to parse JSON response from {provider}: {e}")
-            logging.error(f"Raw content: {content}")
+            logging.debug(f"Raw content: {content}")
         except Exception as e:
-            logging.error(f"Error calling {provider} API: {e}")
-            logging.error(f"Full error details: {str(e)}")
-            # Don't raise, just log and continue to next batch
+            logging.error(f"Error calling {provider} API for item {i+1}: {e}")
+            # Continue to next item
             
     return results
+
+def analyze_single_item(item, api_key, provider="Perplexity"):
+    """
+    Analyzes a single news item.
+    Returns a list of result dictionaries (usually 0 or 1, but could be multiple if multiple entities found).
+    """
+    # Validate provider
+    if provider not in LLM_PROVIDERS:
+        logging.error(f"Invalid provider: {provider}. Defaulting to Perplexity.")
+        provider = "Perplexity"
+    
+    # Get provider configuration
+    config = LLM_PROVIDERS[provider]
+    base_url = config["base_url"]
+    model = config["model"]
+    
+    try:
+        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+    except Exception as e:
+        logging.error(f"Failed to initialize {provider} client: {e}")
+        return [], {"error": str(e)}
+
+    results = []
+    
+    # Prepare content
+    full_text = item.get('full_text', '')
+    
+    # Check if we need to use Perplexity Search Mode (Fallback)
+    if not full_text or len(full_text) < 100:
+        logging.warning(f"Content too short/empty for '{item['title']}'. Switching to Perplexity Search Mode.")
+        content_to_use = f"Target News Title: {item['title']}\nSource: {item['source']}\n\n(Instructions: The original link could not be scraped. Please SEARCH for this news event online, read the details, and then extract the negative entities based on your search results.)"
+        scraping_method = "Perplexity Search Fallback"
+    else:
+        content_to_use = full_text[:10000] # Truncate if using full text
+        scraping_method = "Trafilatura Scraper"
+
+    # Debug: Log content being analyzed
+    logging.info(f"Analyzing content (len={len(content_to_use)}): {content_to_use[:100]}...")
+    
+    system_prompt = (
+        "# Role: Negative News Entity Extractor (Full Name Only)\n\n"
+        "# Objective:\n"
+        "分析輸入的新聞文本（或根據標題自行搜尋相關報導），精準提取「負面新聞人物（犯罪嫌疑人、違法者、被調查對象）」的**完整真實姓名**。\n\n"
+        "# Constraints & Guidelines:\n\n"
+        "1.  **Language Filter (語言過濾):**\n"
+        "    - 僅處理「繁體中文」或「簡體中文」內容。\n"
+        "    - 若新聞內容主要為非中文或無法閱讀（如 \"Redirecting...\", \"JavaScript required\"），請回傳空結果並標註 status 為 error。\n\n"
+        "2.  **Target Entity Definition (目標實體定義):**\n"
+        "    - 提取對象：涉嫌犯罪、違法、被捕、被起訴、被搜索、被約談、被判刑的人物。\n"
+        "    - **嚴格排除**：執法人員（警察、檢察官）、受害者、無辜路人、律師、單純受訪者。\n\n"
+        "3.  **Exclude Aliases & Partial Names (排除代稱與不完整姓名 - 核心規則):**\n"
+        "    - **嚴格禁止提取代稱**：請忽略所有「X姓男子」、「X某」、「X嫌」、「X男/女」等不完整稱呼。\n"
+        "    - **僅提取全名**：目標必須具備完整的姓氏與名字（如：陳小華、王大明）。\n"
+        "    - 若文中僅出現代稱（如「陳姓主嫌」）而未出現全名，請**不要提取**任何內容。\n\n"
+        "4.  **Handle Name with Romanization (處理附帶英文名):**\n"
+        "    - 必須提取後方跟隨英文譯名的中文姓名。\n"
+        "      - 範例：「馬來西亞金融家**劉特佐**（Low Taek Jho）」 -> 提取：**劉特佐**。\n\n"
+        "5.  **Contextual Logic & Action Verbs (行為動詞優先):**\n"
+        "    - 判斷依據是**負面行為**，而非職稱。\n"
+        "    - 無論職稱是「工程師」、「金融家」或「官員」，只要涉及：**挪用、詐騙、侵占、洗錢、收賄、內線交易、製毒、砍人**，即必須提取。\n"
+        "    - **警匪邏輯**：「警員**王大明**逮捕了**陳小華**」 -> 提取：**陳小華**。\n\n"
+        "6.  **Enforcement Targets & Passive Subjects (執法對象/被動語態):**\n"
+        "    - **Crucial Rule**: 即使沒有描述正在犯罪，只要是**執法行動的對象**，就必須提取。\n"
+        "    - **被動情境範例**：\n"
+        "      - 「**張大文**被聲押」 -> 提取：**張大文**\n"
+        "      - 「**張姓主嫌**被聲押」 -> **忽略** (代稱)\n"
+        "      - 「警方前往**王男**住處搜索」 -> **忽略** (代稱)\n"
+        "      - 「警方前往**王朝貴**住處搜索」 -> 提取：**王朝貴**\n"
+        "      - 「**林xx**轉為被告」 -> **忽略** (不完整)\n"
+        "      - 「**林天明**轉為被告」 -> 提取：**林天明**\n\n"
+        "# Output Format (JSON Only):\n"
+        "請僅回傳符合以下 JSON Schema 的純 JSON 字串，不要包含 Markdown 代碼塊：\n\n"
+        "{\n"
+        "  \"thought_process\": \"Step 1: Found News Sources - List the specific news article(s) found (Title/Source). Step 2: Entity Evaluation - Identify individuals mentioned and explicitly state why they are excluded (e.g., 'Wang is an official', 'No specific suspect named'). Step 3: Final Selection - Only include those who pass all filters.\",\n"
+        "  \"status\": \"success\",\n"
+        "  \"extracted_entities\": [\n"
+        "    {\n"
+        "      \"name\": \"提取到的完整姓名\",\n"
+        "      \"original_text_pattern\": \"原文形式 (如: 被告謝聲德)\",\n"
+        "      \"reason\": \"簡短說明 (例如: 涉嫌洗錢，被判刑 / 遭檢警約談)\"\n"
+        "    }\n"
+        "  ]\n"
+        "}"
+    )
+    
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"# Input Text:\n{content_to_use}"}
+            ],
+            temperature=0.0
+        )
+        
+        content = response.choices[0].message.content
+        
+        # Debug: Log raw response
+        logging.info(f"LLM Response for '{item.get('title', 'Unknown')[:50]}...': {content[:200]}...")
+        
+        # Clean up markdown code blocks
+        if content.startswith("```json"):
+            content = content.replace("```json", "").replace("```", "")
+        elif content.startswith("```"):
+            content = content.replace("```", "")
+        
+        # Strip whitespace
+        content = content.strip()
+        
+        parsed_data = json.loads(content)
+        
+        # Debug: Log parsed status
+        logging.info(f"Parsed status: {parsed_data.get('status')}, entities count: {len(parsed_data.get('extracted_entities', []))}")
+        
+        if parsed_data.get("status") == "success":
+            entities = parsed_data.get("extracted_entities", [])
+            if entities:
+                names = [e['name'] for e in entities if e.get('name')]
+                reasons = [f"{e['name']}: {e['reason']}" for e in entities if e.get('name') and e.get('reason')]
+                summary = "; ".join(reasons)
+                
+                if not summary:
+                    summary = item.get('title', 'No summary available')
+
+                if names:
+                    results.append({
+                        "names": names,
+                        "summary": summary,
+                        "source_name": item['source'],
+                        "source_url": item['link'],
+                        # Pass through metadata for DataFrame
+                        "keyword": item.get('keyword', ''),
+                        "pub_date": item.get('pub_date', '')
+                    })
+        else:
+            logging.warning(f"LLM returned non-success status for '{item.get('title', 'Unknown')[:50]}': {parsed_data.get('status')}")
+        
+    except json.JSONDecodeError as e:
+        logging.error(f"Failed to parse JSON response from {provider}: {e}")
+        logging.error(f"Raw content was: {content[:500] if 'content' in dir() else 'N/A'}")
+    except Exception as e:
+        logging.error(f"Error calling {provider} API: {e}")
+        
+    debug_info = {
+        "input_content": content_to_use,
+        "raw_response": content if 'content' in locals() else "No response or error occurred",
+        "scraping_method": scraping_method
+    }
+    
+    return results, debug_info
