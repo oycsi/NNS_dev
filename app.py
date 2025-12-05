@@ -53,26 +53,31 @@ if 'is_scanning' not in st.session_state:
     st.session_state.is_scanning = False
 if 'stop_scan' not in st.session_state:
     st.session_state.stop_scan = False
+# NEW: Define default keywords constant
+DEFAULT_KEYWORDS = [
+    "販毒", "毒品", "製毒", "運毒",
+    "詐貸", "詐欺", "詐騙集團", "車手", "水房", "假投資", "假交友",
+    "逃稅", "漏稅", "逃漏稅", 
+    "賭博罪", "地下賭場", "線上博弈",
+    "黑幫", "幫派", "組織犯罪",
+    "走私", "私煙", "私酒", "私藥", "偽藥",
+    "貪污", "收賄", "圖利", "貪腐",
+    "侵佔", "挪用", "掏空",
+    "人口販運", "人口販賣",
+    "洗錢", "制裁", "資恐",
+    "證交法", "洗錢防制法", "刑法", "廢棄物清理法", "食安法",
+    "內線", "虛擬貨幣",
+]
+
 if 'available_keywords' not in st.session_state:
     # Try to load from local storage
     stored_keywords = localS.getItem("user_keywords")
     if stored_keywords and isinstance(stored_keywords, list):
         st.session_state.available_keywords = stored_keywords
     else:
-        st.session_state.available_keywords = [
-            "販毒", "毒品", "製毒", "運毒",
-            "詐貸", "詐欺", "詐騙集團", "車手", "水房", "假投資", "假交友",
-            "逃稅", "漏稅", "逃漏稅", 
-            "賭博罪", "地下賭場", "線上博弈",
-            "黑幫", "幫派", "組織犯罪",
-            "走私", "私煙", "私酒", "私藥", "偽藥",
-            "貪污", "收賄", "圖利", "貪腐",
-            "侵佔", "挪用", "掏空",
-            "人口販運", "人口販賣",
-            "洗錢", "制裁", "資恐",
-            "證交法", "洗錢防制法", "刑法", "廢棄物清理法", "食安法",
-            "內線", "虛擬貨幣",
-        ]
+        # Initialize with default and save to localStorage
+        st.session_state.available_keywords = DEFAULT_KEYWORDS.copy()
+        localS.setItem("user_keywords", st.session_state.available_keywords)
 if 'selected_keywords' not in st.session_state:
     st.session_state.selected_keywords = st.session_state.available_keywords.copy()
 if 'llm_provider' not in st.session_state:
@@ -379,7 +384,34 @@ if start_btn:
                 time.sleep(0.5)
             
             st.session_state.scraped_news = all_rss_items
-            status_container.update(label=f"Metadata fetch complete. Found {len(all_rss_items)} items.", state="complete", expanded=False)
+            
+            # NEW: API key check & title screening
+            if api_key and all_rss_items:
+                try:
+                    status_container.write("正在進行 AI 標題快篩...")
+                    screened_items = llm_service.screen_titles(
+                        all_rss_items, 
+                        final_keywords, 
+                        api_key, 
+                        provider=st.session_state.llm_provider
+                    )
+                    
+                    if screened_items:
+                        removed_count = len(all_rss_items) - len(screened_items)
+                        st.session_state.scraped_news = screened_items
+                        status_container.write(f"標題快篩完成。已過濾 {removed_count} 篇不相關新聞。")
+                        # Add a log message for screening result
+                        log_container.markdown(f"<div style='color: blue; margin-bottom: 4px;'>🤖 [AI 快篩] 保留 {len(screened_items)} / {len(all_rss_items)} 篇新聞</div>", unsafe_allow_html=True)
+                    else:
+                        st.warning("標題快篩後沒有保留任何新聞。")
+                        st.session_state.scraped_news = []
+
+                except Exception as e:
+                    st.error(f"標題快篩發生錯誤，將顯示所有新聞: {e}")
+                    # Fail open: keep st.session_state.scraped_news as all_rss_items
+                    logging.error(f"Title screening failed: {e}")
+
+            status_container.update(label=f"Metadata fetch complete. Found {len(st.session_state.scraped_news)} items.", state="complete", expanded=False)
             
         except Exception as e:
             st.error(f"Error during metadata fetch: {e}")
