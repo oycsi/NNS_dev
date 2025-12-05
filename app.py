@@ -45,14 +45,19 @@ st.set_page_config(
 localS = LocalStorage()
 
 # Initialize Session State
-if 'scraped_news' not in st.session_state:
-    st.session_state.scraped_news = []
+if 'current_results' not in st.session_state:
+    # 建立 current_results 用於存放搜尋結果，確保不會因為左側參數變動而消失
+    st.session_state.current_results = []
 if 'analysis_results' not in st.session_state:
     st.session_state.analysis_results = []
 if 'is_scanning' not in st.session_state:
     st.session_state.is_scanning = False
 if 'stop_scan' not in st.session_state:
     st.session_state.stop_scan = False
+if 'current_job_config' not in st.session_state:
+    st.session_state.current_job_config = None
+if 'trigger_scan' not in st.session_state:
+    st.session_state.trigger_scan = False
 # NEW: Define default keywords constant
 DEFAULT_KEYWORDS = [
     "販毒", "毒品", "製毒", "運毒",
@@ -295,7 +300,29 @@ with st.sidebar:
     
     col1, col2 = st.columns(2)
     with col1:
-        start_btn = st.button("Start Scan", type="primary", use_container_width=True)
+        # Define callback for Start Scan
+        def start_scan_callback():
+            # Snapshot configuration
+            st.session_state.current_job_config = {
+                'keywords': st.session_state.selected_keywords,
+                'date_range': date_range,
+                'provider': st.session_state.llm_provider,
+                'api_key': api_key
+            }
+            
+            # Set trigger flag
+            st.session_state.trigger_scan = True
+            
+            # Reset states
+            st.session_state.current_results = [] 
+            st.session_state.analysis_results = []
+            st.session_state.stop_scan = False
+            st.session_state.scan_completed = False
+            st.session_state.show_aggregation = False
+            st.session_state.show_analysis = False
+            st.session_state.workflow_stage = 'metadata_review'
+
+        st.button("Start Scan", type="primary", use_container_width=True, on_click=start_scan_callback)
     with col2:
         stop_btn = st.button("Stop", type="secondary", use_container_width=True)
 
@@ -308,31 +335,34 @@ with st.sidebar:
 if 'workflow_stage' not in st.session_state:
     st.session_state.workflow_stage = 'config' # config, metadata_review, processing, completed
 
-# 1. Start Scan Button (Config Stage)
-if start_btn:
-    st.session_state.scraped_news = [] # Reset on new scan
-    st.session_state.analysis_results = []
-    st.session_state.stop_scan = False
-    st.session_state.scan_completed = False
-    st.session_state.show_aggregation = False
-    st.session_state.show_analysis = False
-    st.session_state.workflow_stage = 'metadata_review' # Move to next stage
+# 1. Start Scan Logic (Triggered by Callback)
+if st.session_state.trigger_scan:
+    # Reset trigger immediately to prevent re-execution on next rerun without click
+    # But we need to run the logic first. 
+    # Actually, if we use a callback, the script reruns. 
+    # So 'trigger_scan' will be True on the rerun.
+    # We should set it to False AFTER the logic is done.
+    
+    final_keywords = st.session_state.current_job_config['keywords']
+    # api_key and date_range are already in config
     
     if not final_keywords:
         st.warning("Please select or enter at least one keyword.")
         st.session_state.workflow_stage = 'config' # Revert
+        st.session_state.trigger_scan = False
     else:
         # Execute Stage 1: Metadata Fetching
         st.subheader("Stage 1: Metadata Fetching")
         status_container = st.status("Fetching metadata...", expanded=True)
         
-        # Handle date range
-        if isinstance(date_range, tuple):
-            start_date = date_range[0]
-            end_date = date_range[1] if len(date_range) > 1 else start_date
+        # Handle date range from config
+        config_date_range = st.session_state.current_job_config['date_range']
+        if isinstance(config_date_range, tuple):
+            start_date = config_date_range[0]
+            end_date = config_date_range[1] if len(config_date_range) > 1 else start_date
         else:
-            start_date = date_range
-            end_date = date_range
+            start_date = config_date_range
+            end_date = config_date_range
 
         # Fetch RSS Items with Granular Progress
         try:
@@ -343,9 +373,15 @@ if start_btn:
             progress_bar = st.progress(0)
             log_container = st.empty() # For persistent logs
             
-            total_keywords = len(final_keywords)
+            config_keywords = st.session_state.current_job_config['keywords']
+            total_keywords = len(config_keywords)
             
-            for idx, keyword in enumerate(final_keywords):
+            for idx, keyword in enumerate(config_keywords):
+                # Check for stop signal
+                if st.session_state.stop_scan:
+                    status_container.update(label="Scan stopped by user.", state="error")
+                    break
+
                 # Update status
                 status_container.write(f"正在抓取 [{keyword}] 相關新聞... ({idx+1}/{total_keywords})")
                 
@@ -383,47 +419,55 @@ if start_btn:
                 # Small delay to prevent rate limiting and allow UI update
                 time.sleep(0.5)
             
-            st.session_state.scraped_news = all_rss_items
+            # 將抓取到的結果存入 current_results
+            st.session_state.current_results = all_rss_items
             
             # NEW: API key check & title screening
-            if api_key and all_rss_items:
+            config_api_key = st.session_state.current_job_config['api_key']
+            config_provider = st.session_state.current_job_config['provider']
+            
+            if config_api_key and all_rss_items and not st.session_state.stop_scan:
                 try:
                     status_container.write("正在進行 AI 標題快篩...")
                     screened_items = llm_service.screen_titles(
                         all_rss_items, 
-                        final_keywords, 
-                        api_key, 
-                        provider=st.session_state.llm_provider
+                        config_keywords, 
+                        config_api_key, 
+                        provider=config_provider
                     )
                     
                     if screened_items:
                         removed_count = len(all_rss_items) - len(screened_items)
-                        st.session_state.scraped_news = screened_items
+                        st.session_state.current_results = screened_items
                         status_container.write(f"標題快篩完成。已過濾 {removed_count} 篇不相關新聞。")
                         # Add a log message for screening result
                         log_container.markdown(f"<div style='color: blue; margin-bottom: 4px;'>🤖 [AI 快篩] 保留 {len(screened_items)} / {len(all_rss_items)} 篇新聞</div>", unsafe_allow_html=True)
                     else:
                         st.warning("標題快篩後沒有保留任何新聞。")
-                        st.session_state.scraped_news = []
+                        st.session_state.current_results = []
 
                 except Exception as e:
                     st.error(f"標題快篩發生錯誤，將顯示所有新聞: {e}")
-                    # Fail open: keep st.session_state.scraped_news as all_rss_items
+                    # Fail open: keep st.session_state.current_results as all_rss_items
                     logging.error(f"Title screening failed: {e}")
 
-            status_container.update(label=f"Metadata fetch complete. Found {len(st.session_state.scraped_news)} items.", state="complete", expanded=False)
+            status_container.update(label=f"Metadata fetch complete. Found {len(st.session_state.current_results)} items.", state="complete", expanded=False)
             
         except Exception as e:
             st.error(f"Error during metadata fetch: {e}")
             st.session_state.workflow_stage = 'config'
+        
+        # Reset trigger
+        st.session_state.trigger_scan = False
 
 # 2. Persistent Stage 1 Display (Metadata Review)
 # This block runs for 'metadata_review', 'processing', and 'completed' stages
-if st.session_state.workflow_stage != 'config' and st.session_state.scraped_news:
+# 這裡只依賴 current_results 與 workflow_stage，不受左側參數即時變動影響
+if st.session_state.workflow_stage != 'config' and st.session_state.current_results:
     st.subheader("Stage 1: Raw Data Review")
     
     # Display Metadata DataFrame
-    df_metadata = pd.DataFrame(st.session_state.scraped_news)
+    df_metadata = pd.DataFrame(st.session_state.current_results)
     
     # Ensure columns exist before selecting (in case of empty or malformed data)
     available_cols = df_metadata.columns.tolist()
@@ -451,7 +495,7 @@ if st.session_state.workflow_stage != 'config' and st.session_state.scraped_news
     
     # Action Buttons (Only show in 'metadata_review' stage)
     if st.session_state.workflow_stage == 'metadata_review':
-        st.info(f"Found {len(st.session_state.scraped_news)} potential items. Click 'Continue' to fetch content and analyze, or 'Reset' to start over.")
+        st.info(f"Found {len(st.session_state.current_results)} potential items. Click 'Continue' to fetch content and analyze, or 'Reset' to start over.")
         
         col_cont, col_reset = st.columns([1, 1])
         with col_cont:
@@ -460,12 +504,13 @@ if st.session_state.workflow_stage != 'config' and st.session_state.scraped_news
                 st.rerun()
         with col_reset:
             if st.button("Reset", type="secondary", use_container_width=True):
-                st.session_state.scraped_news = []
+                st.session_state.current_results = []
                 st.session_state.workflow_stage = 'config'
                 st.rerun()
 
 # Handle case where no items are found in metadata review
-if st.session_state.workflow_stage == 'metadata_review' and not st.session_state.scraped_news:
+# 只有在 current_results 確實為空且處於 metadata_review 階段時才顯示警告
+if st.session_state.workflow_stage == 'metadata_review' and not st.session_state.current_results:
     st.warning("No items found. Please try different keywords or date range.")
     if st.button("Back to Config"):
         st.session_state.workflow_stage = 'config'
@@ -482,15 +527,19 @@ if st.session_state.workflow_stage == 'processing':
     
     try:
         # Step 2: Sequential Fetch & Analyze with Progress
-        total_items = len(st.session_state.scraped_news)
+        total_items = len(st.session_state.current_results)
         # status_container.write(f"Starting processing for {total_items} items...")
         
         results = []
         processed_items = []
         
         # Check API Key first
-        if not api_key:
-            st.error("Missing API Key. Cannot proceed with analysis.")
+        # Check API Key first (from config)
+        config_api_key = st.session_state.current_job_config.get('api_key') if st.session_state.current_job_config else None
+        config_provider = st.session_state.current_job_config.get('provider') if st.session_state.current_job_config else "Perplexity"
+
+        if not config_api_key:
+            st.error("Missing API Key in job configuration. Cannot proceed with analysis.")
             if st.button("Back to Config"):
                 st.session_state.workflow_stage = 'config'
                 st.rerun()
@@ -513,7 +562,15 @@ if st.session_state.workflow_stage == 'processing':
                 """
                 log_container.markdown(log_html, unsafe_allow_html=True)
 
-            for idx, item in enumerate(st.session_state.scraped_news):
+                log_container.markdown(log_html, unsafe_allow_html=True)
+
+            for idx, item in enumerate(st.session_state.current_results):
+                # Check for stop signal
+                if st.session_state.stop_scan:
+                    update_logs("⚠️ Scan stopped by user.")
+                    status_container.update(label="Scan stopped by user.", state="error")
+                    break
+
                 try:
                     # Update Status & Logs
                     current_progress = (idx + 1) / total_items
@@ -529,8 +586,8 @@ if st.session_state.workflow_stage == 'processing':
                     # 2.2 Analyze (Single Item)
                     item_results, debug_info = llm_service.analyze_single_item(
                         item, 
-                        api_key,
-                        provider=st.session_state.llm_provider
+                        config_api_key,
+                        provider=config_provider
                     )
                     
                     # Debug Inspector (Conditional Rendering)
@@ -557,7 +614,7 @@ if st.session_state.workflow_stage == 'processing':
                 # time.sleep(0.1) 
             
             # Update session state with fully fetched items
-            st.session_state.scraped_news = processed_items
+            st.session_state.current_results = processed_items
             st.session_state.analysis_results = results
             
             # Process and save DataFrame immediately
@@ -588,7 +645,7 @@ if st.session_state.workflow_stage == 'completed':
     
     # Reset Button at the top for convenience
     if st.button("Start New Scan", type="secondary"):
-        st.session_state.scraped_news = []
+        st.session_state.current_results = []
         st.session_state.analysis_results = []
         if 'analysis_results_df' in st.session_state:
             del st.session_state['analysis_results_df']
