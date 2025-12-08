@@ -39,6 +39,8 @@ def fetch_rss_items(keywords, start_date, end_date):
     before_str = end_date_inclusive.strftime("%Y-%m-%d")
 
     for keyword in keywords:
+        if not keyword or not keyword.strip():
+            continue
         try:
             logging.info(f"Fetching RSS for keyword: {keyword}")
             
@@ -87,6 +89,7 @@ def fetch_rss_items(keywords, start_date, end_date):
             
         except Exception as e:
             logging.error(f"Error fetching RSS for {keyword}: {e}")
+            continue
             
     return all_items
 
