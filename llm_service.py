@@ -2,16 +2,21 @@ import openai
 import json
 import logging
 import re
+import time
+import unicodedata
+import random
+from datetime import datetime
+from difflib import SequenceMatcher
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # LLM Provider Configuration
 LLM_PROVIDERS = {
     "Perplexity": {
         "base_url": "https://api.perplexity.ai",
         "model": "sonar-pro",
-        "cheap_model": "sonar" # Lightweight model for screening
+        "cheap_model": "sonar" 
     },
     "OpenAI": {
         "base_url": "https://api.openai.com/v1",
@@ -20,8 +25,8 @@ LLM_PROVIDERS = {
     },
     "Google Gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "model": "gemini-2.0-flash-exp",
-        "cheap_model": "gemini-2.0-flash-exp" # Gemini Flash is already cheap/fast
+        "model": "gemini-2.0-flash",
+        "cheap_model": "gemini-2.0-flash" 
     },
     "Meta Llama (Together.ai)": {
         "base_url": "https://api.together.xyz/v1",
@@ -30,319 +35,432 @@ LLM_PROVIDERS = {
     }
 }
 
-def is_complete_name(name):
+def retry_with_backoff(retries=3, backoff_in_seconds=2):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            x = 0
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if x == retries:
+                        raise e
+                    sleep = (backoff_in_seconds * 2 ** x) + random.uniform(0, 1)
+                    try:
+                        err_msg = str(e)
+                    except UnicodeEncodeError:
+                        err_msg = "UnicodeEncodeError (hidden)"
+                    logger.warning(f"Error in {func.__name__}: {err_msg[:500]}. Retrying in {sleep:.2f}s...")
+                    time.sleep(sleep)
+                    x += 1
+        return wrapper
+    return decorator
+
+def normalize_title(title):
     """
-    Check if a name appears to be a complete name (at least 2 characters for Chinese, 
-    or has both first and last name for English).
+    Enhanced title normalization for deduplication.
+    1. NFKC normalize.
+    2. Remove all whitespace.
+    3. Remove trailing source (short suffix < 25 chars, no punctuation).
+    4. Remove status markers (brackets).
+    5. Keep only alphanumeric/Chinese, lowercase.
+    6. Truncate to first 30 core characters.
     """
-    if not name or not name.strip():
-        return False
+    if not title: return ""
     
+    # 1. NFKC normalize
+    title = unicodedata.normalize('NFKC', title)
+    
+    # 2. 移除所有空白 (User requested removal or compression)
+    title = re.sub(r'\s+', '', title)
+    
+    # 3. 移除常見狀態標示 (括號內容 如：[影音], (更新) 等)
+    title = re.sub(r'[\(\[【](更新|快訊|影音|最新|懶人包|置頂|實況|直擊|組圖|有片|持續更新).*?[\)\]】]', '', title)
+    
+    # 4. 處理分隔符號與來源移除
+    # 支援 [-｜|–—]
+    delimiters = r"[-｜|–—]"
+    parts = re.split(delimiters, title)
+    if len(parts) > 1:
+        last_segment = parts[-1]
+        # 放寬到 25 字元，且不包含中式標點符號 (，。！)
+        if len(last_segment) < 25 and not any(p in last_segment for p in "，。！"):
+            title = "".join(parts[:-1])
+        else:
+            title = "".join(parts)
+            
+    # 5. 僅保留中英數，防止符號造成比對差異
+    title = re.sub(r'[^\u4e00-\u9fffA-Za-z0-9]', '', title)
+    
+    # 6. 核心比對：取前 30 字並轉小寫
+    title = title[:25].lower()
+    
+    return title
+
+# --- Name Validation Constants ---
+INVALID_NAME_PATTERNS = [
+    # 1. 新聞代稱 pattern (姓+身分)
+    r"^[\u4e00-\u9fff]姓(男|女|男子|女子|婦人|嫌犯|被告|車手|船長|乘客|少年|少女|民眾|翁|嫗|嫌|某)$",
+    # 2. 僅有身分詞
+    r"^(男|女|男子|女子|婦人|嫌犯|被告|車手|少年|少女|民眾|死者|傷者|受害者)$"
+]
+
+NICKNAME_PATTERNS = [
+    # 1. 阿字輩 (阿X, 阿XX)
+    r"^阿[\u4e00-\u9fff]{1,2}$",
+    # 2. 小字輩 (小X, 小XX)
+    r"^小[\u4e00-\u9fff]{1,2}$",
+    # 3. 稱謂結尾 (X哥, X姐...)
+    r".+[\u4e00-\u9fff](哥|姊|叔|伯|姨|姐|弟|爸|媽)$"
+]
+
+def is_valid_chinese_name(name):
+    """
+    Strictly filter non-name noise from extracted results.
+    Rules:
+    1. No placeholders (○, *, ＊, X).
+    2. No bad keywords (帕男, 嫌犯, 車主, etc.).
+    3. No bad suffixes (姓, 男, 女, etc.).
+    4. Chinese name length 2-4 characters.
+    5. Enhanced: Regex filtering for news aliases and nicknames.
+    """
+    if not name: return False
     name = name.strip()
     
-    # Chinese name: should be at least 2 characters
-    if re.search(r'[\u4e00-\u9fff]', name):
-        # Count Chinese characters
-        chinese_chars = re.findall(r'[\u4e00-\u9fff]', name)
-        if len(chinese_chars) < 2:
-            return False
-            
-        # Exclude common journalistic placeholders (Surname + Gender/Role)
-        # e.g., 陳男, 林女, 張某, 李嫌, 王氏
-        if re.search(r'^[\u4e00-\u9fff][男女某嫌氏]$', name):
-            return False
+    # --- 1. Basic Character Checks (Existing) ---
+    if any(char in name for char in ['○', '*', '＊', 'X', '?', '？']):
+        return False
         
-        # Exclude "Surname + 姓 + Role/Description" pattern
-        # e.g., 林姓公務員, 陳姓男子
-        if re.search(r'^[\u4e00-\u9fff]姓.+$', name):
+    # --- 2. Enhanced Regex Filtering (New Constraints) ---
+    # Check Invalid Name Patterns (News Aliases)
+    for pattern in INVALID_NAME_PATTERNS:
+        if re.search(pattern, name):
             return False
             
-        return True
-    
-    # English name: should have at least first and last name (space separated)
-    if ' ' in name and len(name.split()) >= 2:
-        return True
-    
-    return False
+    # Check Nickname Patterns
+    for pattern in NICKNAME_PATTERNS:
+        if re.search(pattern, name):
+            return False
 
-def screen_titles(news_items, keywords, api_key, provider="Perplexity"):
-    """
-    Phase 1: Batch Title Screening.
-    Uses a lightweight model to filter out irrelevant titles before content fetching.
-    
-    Args:
-        news_items (list): List of news item dictionaries (from RSS).
-        keywords (list): List of keywords used for search.
-        api_key (str): API Key.
-        provider (str): LLM provider.
+    # --- 3. Keyword/Suffix Exclusion (Existing + Expanded) ---
+    # Expanded bad keywords based on user feedback potential leaks
+    bad_keywords = [
+        '嫌犯', '車主', '乘客', '民眾', '網友', '友人', '家屬', '死者', '主嫌', '被告', '受害者', 
+        '警官', '員警', '消防', '人員', '男大生', '女大生'
+    ]
+    if any(kw in name for kw in bad_keywords):
+        return False
         
-    Returns:
-        list: Filtered list of news items that passed the screening.
+    # Bad suffixes check (Existing logic)
+    bad_suffixes = ('姓', '男', '女', '男子', '女子', '老翁', '老婦', '男童', '女童', '少婦', '先生', '女士', '小姐', '嫌', '氏')
+    if name.endswith(bad_suffixes):
+        # Exception: Some names might end with specific chars that match suffix logic but are valid? 
+        # But '男', '女' at end of 2-3 char name is usually bad (e.g. 陳男).
+        # We rely on this strict rule.
+        return False
+        
+    # --- 4. Character Length & Composition Rules ---
+    # Must contain Chinese
+    if not re.search(r'[\u4e00-\u9fff]', name):
+        return False
+        
+    # Count strictly Chinese characters
+    chinese_chars = re.findall(r'[\u4e00-\u9fff]', name)
+    
+    # Rule: Must be 2-4 Chinese characters NO exceptions for mixed content (strict)
+    if len(chinese_chars) != len(name):
+        return False # Reject "Wang小明" or "David王"
+        
+    if not (2 <= len(chinese_chars) <= 4):
+        return False
+        
+    return True
+
+def cluster_similar_titles(news_items, apikey=None, provider=None, threshold=0.7):
+    """
+    Dual-layer Deduplication. 
+    1. Local Mode (apikey=None): Uses SequenceMatcher with threshold.
+    2. AI Mode (apikey exists): Uses LLM to identify semantic duplicates (same event).
     """
     if not news_items:
-        return []
+        return [], 0
         
-    # Validate provider
+    # --- Local Mode (or Fallback) ---
+    if not apikey:
+        removed_count = 0
+        unique_items = []
+        
+        # Pre-sort by pub_date to preserve the earliest
+        def get_sort_key(x):
+            d = x.get('pub_date', '')
+            if not d: return "9999-12-31"
+            return str(d)
+
+        try:
+            sorted_items = sorted(news_items, key=get_sort_key)
+        except:
+            sorted_items = news_items
+
+        for item in sorted_items:
+            is_duplicate = False
+            title_curr = item['title']
+            norm_curr = normalize_title(title_curr)
+            
+            for existing in unique_items:
+                # 1. Exact normalized match
+                if norm_curr and norm_curr == normalize_title(existing['title']):
+                    is_duplicate = True
+                    break
+                    
+                # 2. Fuzzy matching using the provided threshold (local)
+                similarity = SequenceMatcher(None, title_curr, existing['title']).ratio()
+                if similarity > threshold:
+                    is_duplicate = True
+                    break
+            
+            if is_duplicate:
+                removed_count += 1
+            else:
+                unique_items.append(item)
+                
+        return unique_items, removed_count
+
+    # --- AI Mode (Deep Semantic Deduplication) ---
+    if provider not in LLM_PROVIDERS: provider = "OpenAI"
+    config = LLM_PROVIDERS[provider]
+    client = openai.OpenAI(api_key=apikey, base_url=config["base_url"])
+    model = config.get("cheap_model", config["model"])
+
+    # Prepare titles list with IDs
+    titles_with_id = []
+    for idx, item in enumerate(news_items):
+        titles_with_id.append({"id": idx, "title": item['title']})
+
+    system_prompt = (
+        "你是一項專業的新聞分析助理。你的任務是從清單中找出「描述同一事件」的重複新聞標題。\n"
+        "【判斷標準】\n"
+        "- 高度相似的文字描述 (如: 『詐欺條例初審』與『詐欺防制條例初審』)\n"
+        "- 描述同一個具體案件或法律進展的新聞\n"
+        "- 僅有媒體來源名稱差異 (如: 『...-ETtoday』與『...-MSN』)\n\n"
+        "【輸出要求】\n"
+        "- 請將清單分組，每一組代表同一個事件。\n"
+        "- 每一組中請選出一個『代表案項』（通常是最完整的標題），並列出該組中『其他所有重複的索引 ID』。\n"
+        "- 請只回傳一個 JSON 陣列，包含所有應被移除的重複索引 ID。\n"
+        "- 不要回傳任何解釋，格式範例: [2, 5, 12, 18]\n"
+        "若無重複，請回傳 []。"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": json.dumps(titles_with_id, ensure_ascii=False)}],
+            temperature=0.0
+        )
+        content = response.choices[0].message.content
+        if content.startswith("```"): content = re.sub(r'```json\n?|```', '', content)
+        indices_to_remove = set(json.loads(content))
+        
+        # Ensure indices are valid
+        valid_removals = [idx for idx in indices_to_remove if isinstance(idx, int) and 0 <= idx < len(news_items)]
+        
+        unique_items = [item for idx, item in enumerate(news_items) if idx not in valid_removals]
+        removed_count = len(news_items) - len(unique_items)
+        
+        return unique_items, removed_count
+    except Exception as e:
+        logger.error(f"AI Deduplication failed: {e}")
+        # Fallback to local mode (0.85 threshold for safety)
+        return cluster_similar_titles(news_items, apikey=None, threshold=0.85)
+
+def screen_titles(news_items, keywords, api_key, provider="Perplexity"):
+    if not news_items:
+        return []
     if provider not in LLM_PROVIDERS:
-        logging.error(f"Invalid provider: {provider}. Defaulting to Perplexity.")
         provider = "Perplexity"
     
     config = LLM_PROVIDERS[provider]
-    base_url = config["base_url"]
-    model = config.get("cheap_model", config["model"]) # Use cheap model if available
+    client = openai.OpenAI(api_key=api_key, base_url=config["base_url"])
+    model = config.get("cheap_model", config["model"])
     
-    try:
-        client = openai.OpenAI(api_key=api_key, base_url=base_url)
-        logging.info(f"Screening titles using {provider} with model {model}")
-    except Exception as e:
-        logging.error(f"Failed to initialize {provider} client: {e}")
-        return news_items # Fail open (return all) if client init fails
-        
     screened_items = []
-    
-    # Process in batches of 20
     batch_size = 20
     for i in range(0, len(news_items), batch_size):
         batch = news_items[i:i+batch_size]
-        
-        # Prepare context
-        titles_text = ""
-        for idx, item in enumerate(batch):
-            titles_text += f"{idx+1}. {item['title']} (Source: {item['source']})\n"
-            
-        keyword_str = ", ".join(keywords)
-        
-        system_prompt = (
-            f"你是一位負面新聞篩選專家。\n"
-            "你的任務是：檢視一份新聞標題清單，判斷哪些標題是**與「{keyword_str}」可能相關的負面新聞**，並挑出這些標題。\n"
-            "請採取「召回優先」的原則：在無法確定時，**寧可保留，不要漏掉**。\n"
-            "【應該保留的標題（擇一符合即保留）】\n"
-            "1. 明確暗示犯罪或重大不當行為"
-            "-（例如：詐欺、詐騙、洗錢、賄賂、貪污、挪用、侵佔、逃漏稅、稅務違規、偷稅、少報稅、虛假申報收入、毒品犯罪、組織犯罪、非法博弈、人口販運、違反制裁等）\n"
-            "2. 暗示有法律／監管／執法相關行動"
-            "-（例如：被調查、遭搜索、起訴、偵辦、逮捕、羈押、判刑、裁罰、罰款、撤照、停權、追繳、查處等）\n"
-            "3. 描述嚴重的負面商業事件"
-            "-（例如：重大財報不實、嚴重公司治理失靈、大規模客戶受害、重大資安外洩、重大財務舞弊、重大法律訴訟、重大監管罰則、逃漏稅等）\n"  
-            "4. 提到具體個人或機構，且處於**可能有損名譽或風險**的情境"
-            "-（例如：被指控、遭質疑、被懷疑涉及犯罪、被提告、被檢調約談、被重度批評等）。\n"
-            "5. 標題雖不夠明確，但**合理推測可能涉及醜聞、犯罪、監管問題或重大違規**\n"
-            "【應該丟棄的標題（任一明確符合即可丟棄）】\n"
-            "1. 明顯為正面或中性新聞"
-            "（例如：得獎、公益捐款、企業社會責任、新品發表、合作案、一般營收成長或財報佳訊等）。\n"
-            "2. 只是市場／價格／總體經濟的概況報導"
-            "-（例如：股價漲跌、指數變化、匯率波動、一般景氣評論等），且**沒有任何醜聞、犯罪或不當行為跡象**。\n"
-            "3. 看起來像是廣告、行銷文案、公關稿、贊助內容或活動宣傳。"
-            "4. 明確屬於體育、娛樂、生活、時尚、八卦等題材，且**與犯罪、詐欺、貪腐毫無關聯**。"
-            "5. 只是在順帶一提地出現關鍵字，真正主題與風險事件無關。"
-            "【輸出格式（非常重要）】\n"
-            "- 你會收到一份有順序的標題清單，索引從 1 開始編號。\n"
-            "- 請只回傳一個JSON「整數陣列」，內容是**應該保留的標題索引**\n"
-            "- 不要回傳任何解釋、文字說明或欄位名稱，只能回傳純陣列。\n"
-            "- 如果沒有任何標題需要保留，請回傳 []。\n"
-            "合法範例：\n"
-            "[1, 3, 5, 12]\n"
-            "[]"
-        )
-        
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": titles_text}
-                ],
-                temperature=0.0 # Deterministic
-            )
-            
-            content = response.choices[0].message.content
-            
-            # Clean up markdown
-            if content.startswith("```json"):
-                content = content.replace("```json", "").replace("```", "")
-            elif content.startswith("```"):
-                content = content.replace("```", "")
-                
-            indices = json.loads(content)
-            
-            if isinstance(indices, list):
-                for idx in indices:
-                    if isinstance(idx, int) and 1 <= idx <= len(batch):
-                        screened_items.append(batch[idx-1])
-            
-        except Exception as e:
-            logging.error(f"Error during title screening batch {i}: {e}")
-            # If screening fails, keep the whole batch to be safe (Fail Open)
-            screened_items.extend(batch)
-            
-    logging.info(f"Screening complete. Kept {len(screened_items)} out of {len(news_items)} items.")
+        batch_screened = _call_screen_titles_batch(client, model, batch, keywords)
+        screened_items.extend(batch_screened)
     return screened_items
 
-
-
-def analyze_single_item(item, api_key, provider="Perplexity"):
-    """
-    Analyzes a single news item.
-    Returns a list of result dictionaries (usually 0 or 1, but could be multiple if multiple entities found).
-    """
-    # Validate provider
-    if provider not in LLM_PROVIDERS:
-        logging.error(f"Invalid provider: {provider}. Defaulting to Perplexity.")
-        provider = "Perplexity"
+@retry_with_backoff(retries=3)
+def _call_screen_titles_batch(client, model, batch, keywords):
+    titles_text = ""
+    for idx, item in enumerate(batch):
+        titles_text += f"{idx+1}. {item['title']} (Source: {item['source']})\n"
     
-    # Get provider configuration
-    config = LLM_PROVIDERS[provider]
-    base_url = config["base_url"]
-    model = config["model"]
+    keyword_str = ", ".join(keywords)
+    system_prompt = (
+        f"你是一位負面新聞篩選專家。請檢視清單並挑出與「{keyword_str}」高度相關且含有風險（如犯罪、違法、調查、醜聞）的新聞。\n"
+        "回傳 JSON 整數陣列，內容為推薦保留的索引。不要回傳任何文字說明。"
+    )
     
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": titles_text}],
+        temperature=0.0
+    )
+    content = response.choices[0].message.content
+    if content.startswith("```"): content = re.sub(r'```json\n?|```', '', content)
     try:
-        client = openai.OpenAI(api_key=api_key, base_url=base_url)
-    except Exception as e:
-        logging.error(f"Failed to initialize {provider} client: {e}")
-        return [], {"error": str(e)}
+        indices = json.loads(content)
+        return [batch[idx-1] for idx in indices if isinstance(idx, int) and 1 <= idx <= len(batch)]
+    except:
+        return []
 
-    results = []
-    
-    # Prepare content
-    full_text = item.get('full_text', '')
-    
-    # Check if we need to use Perplexity Search Mode (Fallback)
-    if not full_text or len(full_text) < 100:
-        logging.warning(f"Content too short/empty for '{item['title']}'. Switching to Perplexity Search Mode.")
-        content_to_use = f"Target News Title: {item['title']}\nSource: {item['source']}\n\n(Instructions: The original link could not be scraped. Please SEARCH for this news event online, read the details, and then extract the negative entities based on your search results.)"
-        scraping_method = "Perplexity Search Fallback"
-    else:
-        content_to_use = full_text[:10000] # Truncate if using full text
-        scraping_method = "Trafilatura Scraper"
-
-    # Debug: Log content being analyzed
-    logging.info(f"Analyzing content (len={len(content_to_use)}): {content_to_use[:100]}...")
-    
-    system_prompt = """
-# Role: Expert Negative News Entity Extractor (Strict Full-Name Policy) #
-
-# Objective: 你是一位精通中文語義分析的犯罪情報專家。你的任務是分析新聞文本，精準提取「負面新聞人物（犯罪嫌疑人、違法者、被調查對象）」的**完整真實姓名**
-
-# Core Logic (Analysis Steps): 在提取之前，請先在腦中執行以下邏輯判斷：
-1. **識別角色**：誰是執法者（主詞）？誰是違法者（受詞）？
-2. **檢查完整性**：違法者的名字是全名（如：王小明）還是代稱（如：王男、王嫌）？
-3. **過濾結果**：若僅有代稱，**絕對不要**提取，直接回傳空結果。
-
-# Strict Constraints & Guidelines (必須嚴格遵守):
-
-1. **Language Filter (語言過濾):** 
-    - 僅處理「繁體中文」或「簡體中文」內容。 
-    - 若新聞內容主要為非中文或無法閱讀（如 "Redirecting...", "JavaScript required"），請回傳 `status: "error"`
-
-2. **Target Entity Definition (目標實體定義):** 
-    - **提取對象**：涉嫌犯罪、違法、被捕、被起訴、被搜索、被約談、被判刑的人物。
-    - **嚴格排除**：執法人員（警察、檢察官、法官）、受害者、無辜路人、律師、單純受訪者。
-
-3. **Exclude Aliases & Partial Names (排除代稱 - 絕對紅線規則):**
-    - **嚴格禁止提取代稱**：忽略所有「X姓XX」、「X某」、「X嫌」、「X員」、「X男/女」、「X歲XX」、「少婦XX」等不完整稱呼。
-    - **僅提取全名**：目標必須具備完整的姓氏與名字（如：陳小華、王大明）。
-    - **Null Rule**：若文中**僅出現**「陳姓主嫌」、「林男」而未出現全名，請回傳空列表 `[]`。
-
-4. **Handle Name with Romanization (處理附帶英文名):**
-    - 必須提取前後方跟隨英文譯名的中文姓名。
-    - 範例：「馬來西亞金融家**劉特佐**（Low Taek Jho）」 -> 提取：`劉特佐`。
-
-5. **Contextual Logic (語境邏輯):**
-    - **警匪邏輯**：在「警員A逮捕了B」的句型中，B是目標，A必須排除。
-    - **範例**：「警員**王大明**逮捕了**陳小華**」 -> 提取：`陳小華` (排除王大明)。
-
-6. **Enforcement Targets & Passive Subjects (被動語態/執法對象):**
-    - 「警員**王大明**逮捕了**陳小華**」 -> 提取：`陳小華` (排除王大明)。
-    - **Crucial Rule**: 即使沒有描述具體犯罪動作，只要是**執法行動的對象**，就必須提取。
-    - **範例**：
-    - 「**張大文**被聲押」 -> 提取：`張大文`
-    - 「**陳小華**被通緝」 -> 提取：`陳小華`
-    - 「**林天明**轉為被告」 -> 提取：`林天明`
-    - 「警方前往**王朝貴**住處搜索」 -> 提取：`王朝貴`
-
-# Negative Examples (錯誤示範 - 請勿犯此類錯誤):
-- ❌ 錯誤提取: "陳男" (原因: 代稱，非全名)
-- ❌ 錯誤提取: "林姓主嫌" (原因: 代稱)
-- ❌ 錯誤提取: "王警官" (原因: 執法人員)
-- ❌ 錯誤提取: "李某" (原因: 不完整姓名)
-- ❌ 錯誤提取: "陳先生" (原因: 過於泛稱，除非確認是負面人物全名)
-
-# Output Format (JSON Only):
-Please return ONLY a JSON object with the following structure:
-{
-  "status": "success" | "error",
-  "thought_process": "Brief explanation of logic",
-  "extracted_entities": [
-    {
-      "name": "Full Name",
-      "original_text_pattern": "Text in article",
-      "reason": "Reason for extraction"
-    }
-  ]
+# --- Weight Dictionaries for Subject Filtering ---
+NEGATIVE_KEYWORDS = {
+    "涉案": 3, "被告": 3, "嫌犯": 3, "被起訴": 3, "被判刑": 3, 
+    "被逮捕": 3, "被查獲": 3, "遭起訴": 3, "遭判刑": 3, "遭逮捕": 3, "遭查獲": 3,
+    "涉詐": 2, "涉毒": 2, "涉貪": 2, "詐騙集團": 2, "車手": 2, "主嫌": 2,
+    "詐欺": 1, "犯罪": 1, "違法": 1, "肇事": 1, "酒駕": 1, "毒駕": 1
 }
-"""
+
+COMMENTATOR_KEYWORDS = {
+    "表示": 2, "說明": 2, "指出": 2, "強調": 2, "批評": 2, "抨擊": 2, "呼籲": 2,
+    "教授": 1, "學者": 1, "系主任": 1, "主任": 1, "市長": 1, "議員": 1, "立委": 1,
+    "部長": 1, "局長": 1, "處長": 1, "記者": 1, "主播": 1, "警官": 1, 
+    "檢察官": 1, "律師": 1
+}
+
+def is_negative_main_subject(entity, filter_config=None):
+    reason = entity.get("reason", "").lower()
+    
+    if filter_config:
+        neg_keywords = filter_config.get("negative_keywords", {})
+        com_keywords = filter_config.get("commentator_keywords", {})
+        threshold_mult = filter_config.get("threshold_multiplier", 1.5)
+    else:
+        neg_keywords = NEGATIVE_KEYWORDS
+        com_keywords = COMMENTATOR_KEYWORDS
+        threshold_mult = 1.5
+    
+    # 計算負面分數
+    neg_score = sum(neg_keywords.get(kw, 0) for kw in neg_keywords 
+                   if kw in reason)
+    
+    # 計算評論角色分數  
+    com_score = sum(com_keywords.get(kw, 0) for kw in com_keywords 
+                   if kw in reason)
+    
+    # 負面分數 > 評論分數 × threshold_mult 才保留
+    result = neg_score > com_score * threshold_mult
+    
+    # debug log（方便之後調參）
+    print(f"[{entity.get('name', 'N/A')}] neg:{neg_score}, com:{com_score}, result:{result}")
+    
+    return result
+
+def analyze_single_item(item, api_key, provider="Perplexity", filter_config=None):
+    if provider not in LLM_PROVIDERS: provider = "Perplexity"
+    config = LLM_PROVIDERS[provider]
+    client = openai.OpenAI(api_key=api_key, base_url=config["base_url"])
+    model = config["model"]
+
+    full_text = item.get('full_text', '')
+    if not full_text or len(full_text) < 100:
+        content_to_use = f"Title: {item['title']}\nSource: {item['source']}\n(Scraping failed, please search internally if needed)"
+        scraping_method = "Search Fallback"
+    else:
+        content_to_use = full_text[:10000]
+        scraping_method = "Scraper"
+
+    system_prompt = (
+        "你是一項即時新聞內容分析程式，請針對提供的「新聞正文」進行人名結構化抽取。\n\n"
+        "【任務目標】\n"
+        "請仔細閱讀提供的文章全螢幕內容（Full Text），找出文中實際參與新聞事件的「中文真實姓名」，並說明原因。\n\n"
+        "【重要原則：標題僅供參考】\n"
+        "- **標題 (Title)**：只用來讓你快速理解這則新聞的主題（例如是車禍、糾紛還是判決）。\n"
+        "- **正文 (Full Text)**：才是人名抽取的唯一依據。**絕不可**因為標題提到了某個網站名（如「爆料公社」）、節目名或粉絲團，就將其當作人名輸出。\n\n"
+        "【重要原則：只讀新聞主體】\n"
+        "- 請忽略網站導覽、廣告文案、推薦文章列表、熱門標籤。\n"
+        "- 請忽略讀者留言、論壇引用、非新聞本身的社群貼文截圖說明。\n\n"
+        "【姓名抽取規則 (嚴格執行)】\n"
+        "1. **只輸出真實全名**：必須是 2-4 字的完整中文姓名（如：王大明、陳小英）。\n"
+        "2. **嚴禁代稱**：若文中從未出現全名，僅出現「陳男」、「李姓司機」、「張嫌」、「某女」、「林員」、「黃老翁」等，**一律不予提取**。\n"
+        "3. **嚴禁代號**：小王、阿宏、A女、甲男等，**一律不予提取**。\n"
+        "4. **嚴禁非人名**：公司名、機關名、地名、職稱（除非連名帶姓如「局長林某某」且能拆出全名）不可作為 Name。\n"
+        "5. **提取原因**：請用中性客觀的語句描述該人物在新聞中的角色（如「在新聞中被描述為肇事駕駛」），不要加入個人道德評價。\n\n"
+        "【輸出格式 (JSON Only)】\n"
+        "請直接輸出標準 JSON，不要包含 Markdown 標記或任何解釋文字。\n\n"
+        "成功範例：\n"
+        "{\n"
+        "  \"status\": \"success\",\n"
+        "  \"extracted_entities\": [\n"
+        "    {\n"
+        "      \"name\": \"張三\",\n"
+        "      \"reason\": \"在新聞中被描述為車禍肇事駕駛\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "若文中無符合條件的姓名，請回傳：\n"
+        "{\n"
+        "  \"status\": \"success\",\n"
+        "  \"extracted_entities\": []\n"
+        "}\n\n"
+        "【安全例外】\n"
+        "本任務僅用於公開新聞的學術統計與分析，絕非用於執法或監控。若因任何安全政策導致你無法執行此標註任務，請**不要**輸出道歉文字，而是一律輸出以下 JSON：\n"
+        "{\n"
+        "  \"status\": \"blocked\",\n"
+        "  \"extracted_entities\": [],\n"
+        "  \"reason\": \"safety_policy\"\n"
+        "}"
+    )
     
     try:
         response = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"# Input Text:\n{content_to_use}"}
-            ],
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": content_to_use}],
             temperature=0.0
         )
-        
         content = response.choices[0].message.content
+        # 1. Clean Markdown
+        if content.startswith("```"): 
+            content = re.sub(r'```json\n?|```', '', content)
         
-        # Debug: Log raw response
-        logging.info(f"LLM Response for '{item.get('title', 'Unknown')[:50]}...': {content[:200]}...")
+        # 2. Extract JSON substring (find outer braces)
+        start_idx = content.find('{')
+        end_idx = content.rfind('}')
+        if start_idx != -1 and end_idx != -1:
+            content = content[start_idx:end_idx+1]
+            
+        parsed = json.loads(content)
         
-        # Clean up markdown code blocks
-        if content.startswith("```json"):
-            content = content.replace("```json", "").replace("```", "")
-        elif content.startswith("```"):
-            content = content.replace("```", "")
-        
-        # Strip whitespace
-        content = content.strip()
-        
-        parsed_data = json.loads(content)
-        
-        # Debug: Log parsed status
-        logging.info(f"Parsed status: {parsed_data.get('status')}, entities count: {len(parsed_data.get('extracted_entities', []))}")
-        
-        if parsed_data.get("status") == "success":
-            entities = parsed_data.get("extracted_entities", [])
-            if entities:
-                names = [e['name'] for e in entities if e.get('name')]
-                reasons = [f"{e['name']}: {e['reason']}" for e in entities if e.get('name') and e.get('reason')]
-                summary = "; ".join(reasons)
+        results = []
+        if parsed.get("status") == "success":
+            # Apply strict name filtering (is_valid_chinese_name) AND Subject filtering
+            valid_entities = []
+            for e in parsed.get("extracted_entities", []):
+                name = e.get('name')
                 
-                if not summary:
-                    summary = item.get('title', 'No summary available')
-
-                if names:
-                    results.append({
-                        "names": names,
-                        "summary": summary,
-                        "source_name": item['source'],
-                        "source_url": item['link'],
-                        # Pass through metadata for DataFrame
-                        "keyword": item.get('keyword', ''),
-                        "pub_date": item.get('pub_date', '')
-                    })
-        else:
-            logging.warning(f"LLM returned non-success status for '{item.get('title', 'Unknown')[:50]}': {parsed_data.get('status')}")
-        
-    except json.JSONDecodeError as e:
-        logging.error(f"Failed to parse JSON response from {provider}: {e}")
-        logging.error(f"Raw content was: {content[:500] if 'content' in dir() else 'N/A'}")
+                # 1. Basic Name Validation
+                if not name or not is_valid_chinese_name(name):
+                    continue
+                    
+                # 2. Negative Main Subject Validation (New)
+                if not is_negative_main_subject(e, filter_config):
+                    continue
+                    
+                valid_entities.append(e)
+            
+            if valid_entities:
+                results.append({
+                    "names": [e['name'] for e in valid_entities],
+                    "summary": "; ".join([f"{e['name']}: {e['reason']}" for e in valid_entities]),
+                    "source_name": item['source'],
+                    "source_url": item['link'],
+                    "keyword": item.get('keyword', ''),
+                    "pub_date": item.get('pub_date', '')
+                })
+        return results, {"scraping_method": scraping_method, "raw_response": content, "input_content": content_to_use}
     except Exception as e:
-        logging.error(f"Error calling {provider} API: {e}")
-        
-    debug_info = {
-        "input_content": content_to_use,
-        "raw_response": content if 'content' in locals() else "No response or error occurred",
-        "scraping_method": scraping_method
-    }
-    
-    return results, debug_info
+        logger.error(f"Error in analyze_single_item: {e}")
+        error_preview = content[:200] if 'content' in locals() and content else "No content"
+        return [], {"error": f"{str(e)} | Raw: {error_preview}...", "scraping_method": scraping_method}

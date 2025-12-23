@@ -6,17 +6,32 @@ import time
 from datetime import datetime, timedelta
 import scraper_web
 import llm_service
-import importlib
 import re
 import os
 import json
 import openai
 from streamlit_local_storage import LocalStorage
 import logging
+import sys
 
-# Force reload for development
-importlib.reload(scraper_web)
-importlib.reload(llm_service)
+# === Nuclear Logging Fix ===
+# 1. Define a completely silent handler
+class SafeHandler(logging.Handler):
+    def emit(self, record):
+        pass
+
+# 2. Force reset root logger to use ONLY the silent handler
+logging.basicConfig(handlers=[SafeHandler()], level=logging.INFO, force=True)
+
+# 3. Aggressively clean up all third-party loggers
+# This prevents libraries like trafilatura from independently writing to closed stderr
+for name in logging.root.manager.loggerDict:
+    logger_obj = logging.getLogger(name)
+    logger_obj.handlers = []
+    logger_obj.propagate = True
+
+# 4. Use module-level logger (will propagate to our Safe Root)
+logger = logging.getLogger(__name__)
 
 # Load peashooter icon
 import base64
@@ -42,6 +57,17 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# UI Optimization: Left-aligned Spinner
+st.markdown("""
+<style>
+    /* 強制 Spinner 靠左對齊 */
+    div[data-testid="stSpinner"] {
+        justify-content: flex-start;
+        text-align: left;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # Initialize Local Storage
 localS = LocalStorage()
 
@@ -52,6 +78,12 @@ if 'analysis_results' not in st.session_state:
     st.session_state.analysis_results = []
 if 'stop_scan' not in st.session_state:
     st.session_state.stop_scan = False
+if 'processing_index' not in st.session_state:
+    st.session_state.processing_index = 0
+if 'error_log' not in st.session_state:
+    st.session_state.error_log = []
+if 'export_bytes' not in st.session_state:
+    st.session_state.export_bytes = None
 if 'current_job_config' not in st.session_state:
     st.session_state.current_job_config = None
 if 'workflow_stage' not in st.session_state:
@@ -59,19 +91,30 @@ if 'workflow_stage' not in st.session_state:
 
 # NEW: Define default keywords constant
 DEFAULT_KEYWORDS = [
-    "販毒", "毒品", "製毒", "運毒",
-    "詐貸", "詐欺", "詐騙集團", "車手", "水房", "假投資", "假交友",
-    "逃稅", "漏稅", "逃漏稅", 
-    "賭博罪", "地下賭場", "線上博弈",
-    "黑幫", "幫派", "組織犯罪",
-    "走私", "私煙", "私酒", "私藥", "偽藥",
+    "毒品",
+    "詐欺", "詐騙集團", "車手", "水房", "假投資", "虛擬貨幣",
+    "逃漏稅", 
+    "賭場",
+    "幫派", "組織犯罪",
+    "走私",
     "貪污", "收賄", "圖利", "貪腐",
     "侵佔", "挪用", "掏空",
-    "人口販運", "人口販賣",
+    "人口販賣",
     "洗錢", "制裁", "資恐",
     "證交法", "洗錢防制法", "刑法", "廢棄物清理法", "食安法",
-    "內線", "虛擬貨幣",
+    
 ]
+
+DEFAULT_NEG_KEYWORDS = {
+    "涉案": 3, "被告": 3, "嫌犯": 3, "被起訴": 3, "被判刑": 3, "被逮捕": 3, "被查獲": 3,
+    "涉詐": 2, "涉毒": 2, "涉貪": 2, "詐騙集團": 2, "車手": 2, "主嫌": 2,
+    "詐欺": 1, "犯罪": 1, "違法": 1, "肇事": 1, "酒駕": 1, "毒駕": 1
+}
+DEFAULT_COM_KEYWORDS = {
+    "表示": 2, "說明": 2, "指出": 2, "強調": 2, "批評": 2, "抨擊": 2, "呼籲": 2,
+    "教授": 1, "學者": 1, "系主任": 1, "主任": 1, "市長": 1, "議員": 1, "立委": 1,
+    "部長": 1, "局長": 1, "處長": 1, "記者": 1, "主播": 1, "警官": 1, "檢察官": 1, "律師": 1
+}
 
 if 'available_keywords' not in st.session_state:
     # Try to load from local storage
@@ -86,6 +129,12 @@ if 'selected_keywords' not in st.session_state:
     st.session_state.selected_keywords = st.session_state.available_keywords.copy()
 if 'llm_provider' not in st.session_state:
     st.session_state.llm_provider = "Perplexity"
+if 'dedup_threshold' not in st.session_state:
+    st.session_state.dedup_threshold = 0.7
+
+# Callbacks for threshold synchronization
+def update_threshold_from_slider():
+    st.session_state.dedup_threshold = st.session_state.threshold_slider / 100.0
 
 # Helper function to check for Chinese characters
 def has_chinese(text):
@@ -116,7 +165,7 @@ def to_excel(df):
                     worksheet.set_column(i, i, column_len)
         return output.getvalue()
     except Exception as e:
-        print(f"Export error: {e}")
+        logger.error(f"Export error: {e}")
         return None
 
 # Helper function to prepare Stage 1 export data (filter columns)
@@ -127,6 +176,45 @@ def prepare_stage1_export_df(df):
     required_columns = ['keyword', 'title', 'link', 'pub_date', 'source']
     # Filter columns that exist in the dataframe
     return df[[col for col in required_columns if col in df.columns]]
+
+def parse_pubdate(pubdate_raw):
+    if not pubdate_raw: return ""
+    if isinstance(pubdate_raw, datetime): return pubdate_raw.strftime("%Y-%m-%d %H:%M")
+    s = str(pubdate_raw).strip()
+    # Try clean ISO
+    if 'T' in s:
+        try: return datetime.strptime(s.split('+')[0].split('.')[0], "%Y-%m-%dT%H:%M:%S").strftime("%Y-%m-%d %H:%M")
+        except: pass
+    # Fallback to pandas
+    try:
+        dt = pd.to_datetime(pubdate_raw)
+        if pd.notnull(dt): return dt.strftime("%Y-%m-%d %H:%M")
+    except: pass
+    return ""
+
+def generate_snapshot_excel(results):
+    rows = []
+    for res in results:
+        pd_str = parse_pubdate(res.get('pub_date', ''))
+        # names may be list or string, ensure flatness
+        names = res.get('names', [])
+        if isinstance(names, str): names = [names]
+        for name in names:
+            rows.append({
+                "keyword": res.get('keyword', ''),
+                "pubdate": pd_str,
+                "name": name,
+                "title": res.get('title', ''),  # Use title enriched in Stage 2
+                "url": res.get('source_url', '')
+            })
+    df = pd.DataFrame(rows, columns=["keyword", "pubdate", "name", "title", "url"])
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Results')
+        ws = writer.sheets['Results']
+        for i, col in enumerate(df.columns):
+            ws.column_dimensions[chr(65+i)].width = 20
+    return output.getvalue()
 
 # Helper function to process analysis results into DataFrame
 def process_results_to_df(results):
@@ -192,9 +280,6 @@ with st.sidebar:
     # Determine if we are in config stage (allow editing)
     is_config_stage = st.session_state.workflow_stage == 'config'
     
-    # Debug Mode Toggle
-    debug_mode = st.checkbox("Enable Debug Mode", value=False)
-    
     # LLM Provider Selection
     llm_provider = st.selectbox(
         "LLM Provider",
@@ -209,6 +294,7 @@ with st.sidebar:
         f"{llm_provider} API Key", 
         type="password", 
         help=f"Enter your {llm_provider} API key here.",
+        key="apikey"
     )
     
     # === Keyword Management Section ===
@@ -330,12 +416,45 @@ with st.sidebar:
     with col1:
         # Define callback for Start Scan
         def start_scan_callback():
+            # Build filter_config from session state widgets if enabled
+            filter_config = None
+            if st.session_state.get("enable_custom_weights"):
+                # Get DataFrames from session state (editor output)
+                df_neg = st.session_state.get("editor_neg_keywords")
+                df_com = st.session_state.get("editor_com_keywords")
+                
+                # Convert DataFrame to Dict: {"涉案": 3, ...}
+                neg_w = {}
+                if df_neg is not None and not df_neg.empty:
+                    # Clean up: remove empty keys, convert types
+                    neg_w = {
+                        str(row["關鍵字"]).strip(): int(row["權重"]) 
+                        for _, row in df_neg.iterrows() 
+                        if str(row["關鍵字"]).strip()
+                    }
+                    
+                com_w = {}
+                if df_com is not None and not df_com.empty:
+                    com_w = {
+                        str(row["關鍵字"]).strip(): int(row["權重"]) 
+                        for _, row in df_com.iterrows() 
+                        if str(row["關鍵字"]).strip()
+                    }
+
+                mult = st.session_state.get("filter_threshold_mult", 1.5)
+                filter_config = {
+                    "negative_keywords": neg_w,
+                    "commentator_keywords": com_w,
+                    "threshold_multiplier": mult
+                }
+
             # Snapshot configuration to isolate from sidebar changes
             # NOTE: API Key is intentionally excluded from snapshot to allow dynamic updates
             st.session_state.current_job_config = {
                 'keywords': st.session_state.selected_keywords,
                 'date_range': date_range,
-                'provider': st.session_state.llm_provider
+                'provider': st.session_state.llm_provider,
+                'filter_config': filter_config
             }
             
             # Transition to metadata fetching state
@@ -344,6 +463,9 @@ with st.sidebar:
             # Reset results
             st.session_state.current_results = [] 
             st.session_state.analysis_results = []
+            st.session_state.processing_index = 0
+            st.session_state.error_log = []
+            st.session_state.export_bytes = None
             st.session_state.stop_scan = False
 
         st.button("Start Scan", type="primary", use_container_width=True, on_click=start_scan_callback)
@@ -356,6 +478,81 @@ with st.sidebar:
         st.session_state.stop_scan = True
     
     
+
+    # 5. Advanced Settings (Filtering & Thresholds)
+    with st.expander("進階設定 (Advanced Settings)"):
+        st.markdown("### 1. 去重設定")
+        st.slider(
+            "本地相似度閾值 (%)",
+            min_value=0,
+            max_value=100,
+            value=int(st.session_state.dedup_threshold * 100),
+            key='threshold_slider',
+            step=1,
+            on_change=update_threshold_from_slider,
+            help="設定本地端字串比對的相似度門檻。數值越高，比對越嚴格。"
+        )
+
+        st.markdown("---")
+        st.markdown("### 2. 權重篩選設定")
+        
+        # Default Weights are defined at module level
+        
+        enable_custom_weights = st.checkbox("啟用自訂權重篩選 (Enable Custom Weights)", value=False, key="enable_custom_weights")
+        
+        # UI for adjusting weights
+        if enable_custom_weights:
+            st.caption("請在下方表格直接編輯關鍵字與權重。支援新增、刪除與修改。")
+            
+            # Initialize Default DataFrames in Session State if strictly needed specific initialization
+            # But simpler: Construct on fly if not in editor state? 
+            # Actually st.data_editor handles persistence via key well.
+            # We just need to parse the dicts to DF for 'data' argument.
+            # To prevent reset, we use a cached function or just create it. 
+            # Note: If we pass a new DF every run, data_editor might reset if key is not enough? 
+            # Experimental feature: If data changes, it might reset. modify behavior is safer.
+            # Let's initialize in session_state ONCE.
+
+            if 'df_neg_keywords' not in st.session_state:
+                st.session_state.df_neg_keywords = pd.DataFrame(
+                    list(DEFAULT_NEG_KEYWORDS.items()), columns=["關鍵字", "權重"]
+                )
+            if 'df_com_keywords' not in st.session_state:
+                st.session_state.df_com_keywords = pd.DataFrame(
+                    list(DEFAULT_COM_KEYWORDS.items()), columns=["關鍵字", "權重"]
+                )
+
+            # 1. Negative Keywords
+            with st.expander("負面行為權重 (Negative Weights)", expanded=False):
+                edited_neg_df = st.data_editor(
+                    st.session_state.df_neg_keywords,
+                    num_rows="dynamic",
+                    column_config={
+                        "關鍵字": st.column_config.TextColumn(required=True),
+                        "權重": st.column_config.NumberColumn(min_value=0, max_value=10, step=1, required=True)
+                    },
+                    key="editor_neg_keywords",
+                    use_container_width=True
+                )
+            
+            # 2. Commentator Keywords
+            with st.expander("評論角色權重 (Commentator Weights)", expanded=False):
+                edited_com_df = st.data_editor(
+                    st.session_state.df_com_keywords,
+                    num_rows="dynamic",
+                    column_config={
+                        "關鍵字": st.column_config.TextColumn(required=True),
+                        "權重": st.column_config.NumberColumn(min_value=0, max_value=10, step=1, required=True)
+                    },
+                    key="editor_com_keywords",
+                    use_container_width=True
+                )
+            
+            # 3. Threshold Multiplier
+            st.slider("篩選門檻倍數 (Multiplier)", 1.0, 3.0, 1.5, 0.1, key="filter_threshold_mult", help="保留條件：負面分數 > 評論分數 * 倍數。倍數越高越嚴格。")
+
+        st.markdown("---")
+        debug_mode = st.checkbox("啟用除錯模式 (Debug Mode)", value=False, key="debug_mode_checkbox")
 
 # ==========================================
 # Main Logic - State Machine
@@ -444,46 +641,91 @@ if stage == 'metadata_fetching':
             # Small delay to prevent rate limiting and allow UI update
             time.sleep(0.5)
         
-        # Save results
+        # Save raw fetch results first
         st.session_state.current_results = all_rss_items
-        
-        # AI Title Screening
-        # Use dynamic api_key from sidebar input
-        config_api_key = api_key 
-        config_provider = config['provider']
-        
-        if config_api_key and all_rss_items and not st.session_state.stop_scan:
-            try:
-                status_container.write("正在進行 AI 標題快篩...")
-                screened_items = llm_service.screen_titles(
-                    all_rss_items, 
-                    config_keywords, 
-                    config_api_key, 
-                    provider=config_provider
+
+        if st.session_state.current_results and not st.session_state.stop_scan:
+            
+            # --- 1. Mandatory Local Deduplication (Exact + Fuzzy) ---
+            with st.spinner("正在進行初步去重 (本地運算)..."):
+                # Step 1.1: Exact Dedup (normalize_title)
+                original_count = len(st.session_state.current_results)
+                dedup_map = {}
+                for item in st.session_state.current_results:
+                    norm_t = llm_service.normalize_title(item['title'])
+                    if norm_t not in dedup_map:
+                        dedup_map[norm_t] = item
+                exact_items = list(dedup_map.values())
+                exact_removed = original_count - len(exact_items)
+                
+                # Step 1.2: Fuzzy Dedup (Local Mode)
+                threshold = st.session_state.get('dedup_threshold', 0.7)
+                unique_results, fuzzy_removed = llm_service.cluster_similar_titles(
+                    exact_items, 
+                    apikey=None, # Force Local Mode
+                    threshold=threshold
                 )
                 
-                if screened_items:
-                    removed_count = len(all_rss_items) - len(screened_items)
-                    st.session_state.current_results = screened_items
-                    status_container.write(f"標題快篩完成。已過濾 {removed_count} 篇不相關新聞。")
-                    log_container.markdown(f"<div style='color: blue; margin-bottom: 4px;'>🤖 [AI 快篩] 保留 {len(screened_items)} / {len(all_rss_items)} 篇新聞</div>", unsafe_allow_html=True)
-                else:
-                    st.warning("標題快篩後沒有保留任何新聞。")
-                    st.session_state.current_results = []
+                st.session_state.current_results = unique_results
+                total_removed = exact_removed + fuzzy_removed
+                
+                if total_removed > 0:
+                    st.session_state.screening_status = f"✅ 本地去重完成！已移除 {total_removed} 筆 (完全重複: {exact_removed}, 相似: {fuzzy_removed})。"
+                    log_container.markdown(f"<div style='color: gray; margin-bottom: 4px;'>� [本地去重] 已移除 {total_removed} 筆 (完全重複:{exact_removed}, 相似:{fuzzy_removed})</div>", unsafe_allow_html=True)
 
-            except Exception as e:
-                st.error(f"標題快篩發生錯誤，將顯示所有新聞: {e}")
-                logging.error(f"Title screening failed: {e}")
+            # --- 2. Conditional AI Title Screening ---
+            config = st.session_state.current_job_config
+            # Get API Key: Try session first, then config fallback
+            api_key = st.session_state.get('apikey') 
+            if not api_key:
+                api_key = config.get('apikey') # Fallback if stored in config
+            
+            if api_key:
+                 try:
+                    status_container.write("正在進行 AI 標題快篩...")
+                    with st.spinner("AI 正在分析標題關聯性..."):
+                        screened_items = llm_service.screen_titles(
+                            st.session_state.current_results, 
+                            config['keywords'], 
+                            api_key, 
+                            provider=config.get('provider', 'Perplexity')
+                        )
+                        removed_count_ai = len(st.session_state.current_results) - len(screened_items)
+                        st.session_state.current_results = screened_items
+                        
+                        ai_msg = f"AI title screening complete. Removed {removed_count_ai} items."
+                        status_container.write(f"{ai_msg} Remaining: {len(screened_items)}.")
+                        
+                        # Update persistent status if items were removed
+                        if removed_count_ai > 0:
+                            current_status = st.session_state.get('screening_status', '')
+                            st.session_state.screening_status = f"{current_status} 🤖 AI 快篩移除 {removed_count_ai} 筆。"
+                            log_container.markdown(f"<div style='color: blue; margin-bottom: 4px;'>� [AI 快篩] 自動移除 {removed_count_ai} 筆不相關新聞</div>", unsafe_allow_html=True)
+                            
+                 except Exception as e:
+                    st.error(f"AI Screening error: {e}")
+                    logger.error(f"Title screening failed: {e}")
+            else:
+                status_container.write("Skipping AI title screening (no API key provided).")
 
-        status_container.update(label=f"Metadata fetch complete. Found {len(st.session_state.current_results)} items.", state="complete", expanded=False)
-        
-        # Transition to next stage (Fall-through)
-        st.session_state.workflow_stage = 'metadata_review'
-        stage = 'metadata_review' # Update local variable for fall-through execution
+        # --- 3. Transition to Metadata Review ---
+        if st.session_state.current_results:
+            status_container.update(label=f"Metadata fetch complete. Found {len(st.session_state.current_results)} items.", state="complete", expanded=False)
+            st.session_state.workflow_stage = 'metadata_review'
+            st.rerun()
+        else:
+            status_container.update(label="No items found.", state="error")
+            st.warning("No items found. Please try different keywords or date range.")
+            if st.button("Back to Config"):
+                st.session_state.workflow_stage = 'config'
+                st.rerun()
 
     except Exception as e:
         st.error(f"Error during metadata fetch: {e}")
-        st.session_state.workflow_stage = 'config'
+        # Allow retry/reset by showing back button or keeping in error state
+        if st.button("Back to Config", key="error_back"):
+            st.session_state.workflow_stage = 'config'
+            st.rerun()
 
 # --- Stage 1.5: Metadata Review (Interactive) ---
 if stage == 'metadata_review':
@@ -521,18 +763,87 @@ if stage == 'metadata_review':
                 key="download_stage1"
             )
         
+        if "screening_status" not in st.session_state:
+            st.session_state.screening_status = ""
+            
         st.info(f"Found {len(st.session_state.current_results)} potential items. Click 'Continue' to fetch content and analyze, or 'Reset' to start over.")
         
-        col_cont, col_reset = st.columns([1, 1])
-        with col_cont:
-            if st.button("Continue (Fetch Content & Analyze)", type="primary", use_container_width=True):
-                st.session_state.workflow_stage = 'processing'
-                stage = 'processing' # Update local variable for fall-through
-        with col_reset:
-            if st.button("Reset", type="secondary", use_container_width=True):
-                st.session_state.current_results = []
-                st.session_state.workflow_stage = 'config'
-                st.rerun()
+        # Action Buttons in 4 columns
+        col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
+        
+        with col_btn1:
+            btn_start = st.button("🚀 開始內容分析", type="primary", use_container_width=True)
+            
+        with col_btn2:
+            btn_rescreen = st.button("重做標題快篩", use_container_width=True, help="使用 AI 重新過濾標題")
+
+        with col_btn3:
+            btn_dedup = st.button("合併相似標題", use_container_width=True, help="合併語意相近的新聞標題")
+                            
+        with col_btn4:
+            btn_reset = st.button("Reset", type="secondary", use_container_width=True)
+
+        # Process button actions outside columns
+        if btn_start:
+            st.session_state.workflow_stage = 'processing'
+            st.session_state.processing_index = 0
+            st.session_state.screening_status = "" 
+            st.rerun()
+
+        if btn_rescreen:
+            apikey = st.session_state.get('apikey', '') 
+            if not apikey:
+                st.session_state.screening_status = "⚠️ 請在側邊欄輸入 API Key 以使用此功能"
+            elif st.session_state.current_results:
+                with st.spinner("AI 正在重新篩選標題..."):
+                    try:
+                        config = st.session_state.current_job_config
+                        screeneditems = llm_service.screen_titles(
+                            st.session_state.current_results, 
+                            config['keywords'], 
+                            apikey, 
+                            config.get('provider', 'Perplexity')
+                        )
+                        removed_count = len(st.session_state.current_results) - len(screeneditems)
+                        st.session_state.current_results = screeneditems
+                        st.session_state.screening_status = f"✅ 標題快篩完成！篩選掉 {removed_count} 筆，保留 {len(screeneditems)} 筆"
+                        st.rerun()
+                    except Exception as e:
+                        st.session_state.screening_status = f"❌ 標題快篩失敗：{e}"
+                        logger.error(f"Redo screening failed: {e}")
+
+        if btn_dedup:
+            if st.session_state.current_results:
+                with st.spinner("正在進行語意分析與合併..."):
+                    try:
+                        apikey = st.session_state.get('apikey', '')
+                        provider = st.session_state.current_job_config.get('provider', 'OpenAI')
+                        original_count = len(st.session_state.current_results)
+                        deduped_items, removed_count = llm_service.cluster_similar_titles(
+                            st.session_state.current_results, 
+                            apikey, 
+                            provider
+                        )
+                        st.session_state.current_results = deduped_items
+                        st.session_state.screening_status = f"✅ 合併完成！原始 {original_count} 筆，移除 {removed_count} 筆，剩餘 {len(deduped_items)} 筆。"
+                        st.rerun()
+                    except Exception as e:
+                        st.session_state.screening_status = f"❌ 合併失敗：{e}"
+                        logger.error(f"Semantic deduplication failed: {e}")
+
+        if btn_reset:
+            st.session_state.current_results = []
+            st.session_state.workflow_stage = 'config'
+            st.session_state.screening_status = "" 
+            st.rerun()
+                
+        # Persistent Status Message (Left-aligned)
+        if st.session_state.screening_status:
+            st.markdown(f"""
+                <div style='text-align: left; padding: 12px; background-color: #f0f2f6; border-radius: 8px; border-left: 5px solid #0068c9; margin-top: 10px; font-family: sans-serif; font-size: 0.95em;'>
+                    {st.session_state.screening_status}
+                </div>
+            """, unsafe_allow_html=True)
 
 # --- Stage 2: Processing (Transient) ---
 if stage == 'processing':
@@ -544,9 +855,9 @@ if stage == 'processing':
     progress_bar = st.progress(0)
     
     try:
-        total_items = len(st.session_state.current_results)
-        results = []
-        processed_items = []
+        items_proc = st.session_state.current_results
+        total_items = len(items_proc)
+        results = st.session_state.analysis_results
         
         # Use config from snapshot
         config = st.session_state.current_job_config
@@ -578,7 +889,13 @@ if stage == 'processing':
                 """
                 log_container.markdown(log_html, unsafe_allow_html=True)
 
-            for idx, item in enumerate(st.session_state.current_results):
+            # === Batch Logic ===
+            start_idx = st.session_state.processing_index
+            end_idx = min(start_idx + 100, total_items)
+            status_container.write(f"Processing Batch: {start_idx+1} to {end_idx} (Total: {total_items})")
+
+            for idx in range(start_idx, end_idx):
+                item = items_proc[idx]
                 # Check for stop signal
                 if st.session_state.stop_scan:
                     update_logs("⚠️ Scan stopped by user.")
@@ -593,15 +910,23 @@ if stage == 'processing':
                     progress_bar.progress(current_progress)
                     
                     # 2.1 Fetch Content
-                    item = scraper_web.fetch_content_single(item)
-                    processed_items.append(item)
+                    if 'full_text' not in item:
+                        item = scraper_web.fetch_content_single(item)
+                        st.session_state.current_results[idx] = item
                     
                     # 2.2 Analyze
                     item_results, debug_info = llm_service.analyze_single_item(
                         item, 
                         config_api_key,
-                        provider=config_provider
+                        provider=config_provider,
+                        filter_config=config.get('filter_config')
                     )
+
+                    if debug_info.get("error"):
+                        error_msg = f"LLM Error: {debug_info['error']}"
+                        st.error(f"{item['title']}: {error_msg}")
+                        st.session_state.error_log.append(error_msg)
+                        update_logs(f"❌ {error_msg}")
                     
                     # Debug Inspector
                     if debug_mode:
@@ -613,30 +938,53 @@ if stage == 'processing':
                             st.code(debug_info.get('raw_response', 'No response'), language='json')
                     
                     if item_results:
+                        for res in item_results: res['title'] = item['title']
                         results.extend(item_results)
                         update_logs(f"✅ Extracted {len(item_results[0]['names'])} entities from '{item['title']}'")
+                    
+                    # Checkpoint
+                    st.session_state.analysis_results = results
+                    st.session_state.processing_index = idx + 1
+                    st.session_state.export_bytes = generate_snapshot_excel(results)
                         
                 except Exception as e:
                     error_msg = f"Error processing item {idx + 1}: {e}"
                     st.error(error_msg)
-                    logging.error(f"Error in Stage 2 loop for item {item.get('title', 'Unknown')}: {e}")
+                    st.session_state.error_log.append(error_msg)
+                    logger.error(f"Error in Stage 2 loop for item {item.get('title', 'Unknown')}: {e}")
                     update_logs(f"❌ {error_msg}")
+                    st.session_state.processing_index = idx + 1
                     continue
             
-            # Update session state
-            st.session_state.current_results = processed_items
-            st.session_state.analysis_results = results
-            
-            # Process and save DataFrame
-            df_results = process_results_to_df(results)
-            st.session_state.analysis_results_df = df_results
-            
-            progress_bar.progress(1.0)
-            status_container.update(label="Analysis Complete!", state="complete", expanded=False)
-            
-            # Transition to completed (Fall-through)
-            st.session_state.workflow_stage = 'completed'
-            stage = 'completed'
+            if st.session_state.stop_scan:
+                status_container.update(label="Paused.", state="error")
+                
+                col_pause1, col_pause2 = st.columns(2)
+                with col_pause1:
+                    if st.button("▶️ Resume Scan", type="primary", use_container_width=True):
+                        st.session_state.stop_scan = False
+                        st.rerun()
+                
+                with col_pause2:
+                    if st.session_state.analysis_results:
+                        # Refresh export bytes with latest results
+                        st.session_state.export_bytes = generate_snapshot_excel(st.session_state.analysis_results)
+                        fname = f"negative_news_snapshot_paused_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                        st.download_button(
+                            label="📥 Download Snapshot",
+                            data=st.session_state.export_bytes,
+                            file_name=fname,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="snapshot_dl_paused",
+                            use_container_width=True
+                        )
+            elif st.session_state.processing_index < total_items:
+                st.rerun()
+            else:
+                progress_bar.progress(1.0)
+                st.session_state.workflow_stage = 'completed'
+                stage = 'completed'
+                st.rerun()
 
     except Exception as e:
         st.error(f"An error occurred during processing: {str(e)}")
@@ -656,6 +1004,7 @@ if stage == 'completed':
     if st.button("Start New Scan", type="secondary"):
         st.session_state.current_results = []
         st.session_state.analysis_results = []
+        st.session_state.export_bytes = None
         if 'analysis_results_df' in st.session_state:
             del st.session_state['analysis_results_df']
         st.session_state.workflow_stage = 'config'
@@ -697,6 +1046,17 @@ if stage == 'completed':
             )
     else:
         st.info("Analysis complete. No negative news entities were found.")
+
+    # Snapshot Export (Always Available if data exists)
+    if st.session_state.export_bytes:
+        fname = f"negative_news_snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        st.download_button(
+            label="📥 Download Snapshot",
+            data=st.session_state.export_bytes,
+            file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="snapshot_dl"
+        )
 
 # Footer
 st.markdown("---")
